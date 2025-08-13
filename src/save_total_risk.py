@@ -41,7 +41,7 @@ def create_analysis():
         analysis.save()
     print("Done!")
 
-def save_farm_risk(input_file, analysis):
+def save_farm_risk(input_file, analysis, chunk_size = 1000):
     df = pd.read_csv(input_file)
 
     # Validate analysis ObjectId
@@ -52,7 +52,14 @@ def save_farm_risk(input_file, analysis):
 
     df['analysis_id'] = analysis
 
-    # Convert each row to FarmRisk and save
+    total = len(df)
+    print(f"Processing {total} farm risk records in chunks of {chunk_size}...")
+
+    for i in tqdm(range(0, total, chunk_size), desc="Bulk inserting FarmRisk"):
+        chunk = df.iloc[i:i+chunk_size].to_dict(orient="records")
+        docs = [FarmRisk(**record) for record in chunk]
+        FarmRisk.objects.insert(docs, load_bulk=False)
+    """
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Saving FarmRisk records"):
         farm_risk = FarmRisk(
             analysis_id=analysis_id,
@@ -70,10 +77,11 @@ def save_farm_risk(input_file, analysis):
             protected_prop=row["protected_prop"]
         )
         farm_risk.save()
+    """
 
     print(f"Saved {len(df)} FarmRisk records with analysis_id={analysis}")
 
-def save_adm3_risk(input_file, analysis):
+def save_adm3_risk(input_file, analysis, chunk_size = 1000):
     # Load CSV into DataFrame
     df = pd.read_csv(input_file)
 
@@ -83,7 +91,14 @@ def save_adm3_risk(input_file, analysis):
     except Exception as e:
         raise ValueError(f"Invalid ObjectId for analysis: {analysis}") from e
 
-    # Iterate through rows and save as Adm3Risk
+    total = len(df)
+    print(f"Processing {total} adm3 risk records in chunks of {chunk_size}...")
+
+    for i in tqdm(range(0, total, chunk_size), desc="Bulk inserting Adm3Risk"):
+        chunk = df.iloc[i:i+chunk_size].to_dict(orient="records")
+        docs = [Adm3Risk(**record) for record in chunk]
+        Adm3Risk.objects.insert(docs, load_bulk=False)
+    """
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Saving Adm3Risk records"):
         adm3_risk = Adm3Risk(
             analysis_id=analysis_id,
@@ -101,6 +116,7 @@ def save_adm3_risk(input_file, analysis):
             adm1_risk=row["adm1_risk"]
         )
         adm3_risk.save()
+    """
 
     print(f"Saved {len(df)} Adm3Risk records with analysis_id={analysis}")
 
