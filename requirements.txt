@@ -1,0 +1,8 @@
+# Dependencias principales
+pandas>=2.0
+mongoengine>=0.29.1
+tqdm
+mongomock
+unittest2
+# ORM desde GitHub
+git+https://github.com/CIAT-DAPA/ganabosques_orm.git@main#egg=ganabosques_orm
