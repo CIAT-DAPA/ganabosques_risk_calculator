@@ -8,6 +8,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from ganabosques_orm.collections.analysis import Analysis
+from ganabosques_orm.auxiliaries.attributes import Attributes
 
 from ganabosques_orm.collections.protectedareas import ProtectedAreas
 from ganabosques_orm.collections.farmingareas import FarmingAreas
@@ -51,7 +52,7 @@ def save_farm_risk(input_file, analysis, chunk_size = 1000):
         raise ValueError(f"Invalid analysis ObjectId: {analysis}") from e
 
     df['analysis_id'] = analysis
-
+    """
     total = len(df)
     print(f"Processing {total} farm risk records in chunks of {chunk_size}...")
 
@@ -69,31 +70,28 @@ def save_farm_risk(input_file, analysis, chunk_size = 1000):
             risk_input=row["risk_input"],
             risk_output=row["risk_output"],
             risk_total=row["risk_total"],
-            deforestation_ha=row["deforestation_ha"],
-            deforestation_prop=row["deforestation_prop"],
-            deforestation_distance=row["deforestation_distance"],
-            protected_distance=row["protected_distance"],
-            protected_ha=row["protected_ha"],
-            protected_prop=row["protected_prop"]
+            deforestation = Attributes(ha = row["deforestation_ha"],prop=row["deforestation_prop"],distance=row["deforestation_distance"]),
+            farming=row["farming"],
+            protected = Attributes(ha = row["protected_ha"],prop=row["protected_prop"],distance=row["protected_distance"])
         )
         farm_risk.save()
-    """
+    
 
     print(f"Saved {len(df)} FarmRisk records with analysis_id={analysis}")
 
 def save_adm3_risk(input_file, analysis, chunk_size = 1000):
     # Load CSV into DataFrame
     df = pd.read_csv(input_file)
-
+ 
     # Validate ObjectId
     try:
         analysis_id = ObjectId(analysis)
     except Exception as e:
         raise ValueError(f"Invalid ObjectId for analysis: {analysis}") from e
-
+    """
     total = len(df)
     print(f"Processing {total} adm3 risk records in chunks of {chunk_size}...")
-
+ 
     for i in tqdm(range(0, total, chunk_size), desc="Bulk inserting Adm3Risk"):
         chunk = df.iloc[i:i+chunk_size].to_dict(orient="records")
         docs = [Adm3Risk(**record) for record in chunk]
@@ -102,21 +100,13 @@ def save_adm3_risk(input_file, analysis, chunk_size = 1000):
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Saving Adm3Risk records"):
         adm3_risk = Adm3Risk(
             analysis_id=analysis_id,
-            adm1_id=row["adm1_id"],
-            adm1_name=row["adm1_name"],
-            adm2_id=row["adm2_id"],
-            adm2_name=row["adm2_name"],
             adm3_id=row["adm3_id"],
-            adm3_name=row["adm3_name"],
-            adm3_score=row["adm3_score"],
-            adm3_risk=row["adm3_risk"],
-            adm2_score=row["adm2_score"],
-            adm2_risk=row["adm2_risk"],
-            adm1_score=row["adm1_score"],
-            adm1_risk=row["adm1_risk"]
+            def_ha=row["def_ha"],
+            farm_amount=row["farm_amount"],
+            risk_total=row["risk_total"]
         )
         adm3_risk.save()
-    """
+    
 
     print(f"Saved {len(df)} Adm3Risk records with analysis_id={analysis}")
 
