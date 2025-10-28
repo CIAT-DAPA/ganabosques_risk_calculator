@@ -115,13 +115,6 @@ def _download_file(url: str, out_path: str):
     return out_path
 
 
-def _name_from_url(url: str, default_name: str) -> str:
-    if not url:
-        return default_name
-    name = url.split("?")[0].split("/")[-1]
-    return name or default_name
-
-
 def _output_dir_for_deforestation(deforestation_id: str) -> str:
     path = os.path.join(OUTPUTS_DIR, "deforestation", deforestation_id)
     os.makedirs(path, exist_ok=True)
