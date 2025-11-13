@@ -44,6 +44,7 @@ from ganabosques_risk_package.entity_alert import calculate_alert
 # PATHS
 # ============================================================================================
 BASE_DIR = "D:\\CIAT\\Code\\BID\\ganabosques_risk_calculator\\data"
+#BASE_DIR = "/home/indicators/ganabosques/data"
 INPUTS_DIR = os.path.join(BASE_DIR, "inputs")
 OUTPUTS_DIR = os.path.join(BASE_DIR, "outputs")
 GEOSERVER_DIR = os.path.join(INPUTS_DIR, "geoserver")
@@ -61,6 +62,7 @@ ENTERPRISE_CSV = os.path.join(CSV_DIR, "enterprise.csv")
 # Output shapefiles (reprojected) to feed the pipeline
 FARMING_SHP_OUT = os.path.join(GEOSERVER_DIR, "farmingareas_target.shp")
 PROTECTED_SHP_OUT = os.path.join(GEOSERVER_DIR, "protectedareas_target.shp")
+PLOTS_TARGET_SHP_OUT = os.path.join(GEOSERVER_DIR, "plots_target.shp")
 
 
 # ============================================================================================
@@ -107,7 +109,7 @@ def _count_q(q):
 
 def _download_file(url: str, out_path: str):
     """Download file with streaming."""
-    print(f"[DOWNLOAD] URL → {url}")
+    #print(f"[DOWNLOAD] URL → {url}")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with requests.get(url, stream=True, timeout=600) as r:
         r.raise_for_status()
@@ -115,7 +117,7 @@ def _download_file(url: str, out_path: str):
             for chunk in r.iter_content(chunk_size=2**20):
                 if chunk:
                     f.write(chunk)
-    print(f"[DOWNLOAD] Saved: {out_path}")
+    #print(f"[DOWNLOAD] Saved: {out_path}")
     return out_path
 
 
@@ -284,7 +286,7 @@ def extract_all_with_orm() -> gpd.GeoDataFrame:
 
     # Return plots as GDF (CRS se asigna y reproyecta luego)
     gdf = gpd.GeoDataFrame(
-        plots_df[["id"]].copy(),
+        plots_df[["id","farm_id","adm3_id"]].copy(),
         geometry=gpd.GeoSeries.from_wkt(plots_df["geometry"]),
         crs=None
     )
@@ -384,7 +386,7 @@ def download_shapefile(csv_path: str, label: str) -> str:
     if not url:
         raise RuntimeError(f"[ERROR] {label} path is empty.")
 
-    if url.lower().endswith(".zip"):
+    if url.lower().endswith("zip"):
         zip_path = os.path.join(GEOSERVER_DIR, f"{label}.zip")
         print(f"[DOWNLOAD] {label} (ZIP) → {zip_path}")
         _download_file(url, zip_path)
@@ -477,7 +479,8 @@ def run_alerts_for_deforestation(plots_gdf_target_crs: gpd.GeoDataFrame,
         protected_areas=protected_shp_target,
         farming_areas=farming_shp_target,
         deforestation_value=2,
-        n_workers=n_workers
+        n_workers=n_workers,
+        id_column="farm_id"
     )
     df_direct.to_csv(alert_direct_csv, index=False)
     print(f"[ALERT] alert_direct → {alert_direct_csv}")
@@ -516,12 +519,16 @@ def main():
     parser.add_argument("--target-crs", type=str, default="EPSG:3116", help="Target CRS for all geodata")
     parser.add_argument("--plots-src-crs", type=str, default="EPSG:4326",
                         help="Source CRS for plots geometries parsed from GeoJSON")
+    parser.add_argument("--deforestation", type=str, default="", help="ID deforestation file to be processed")
+    parser.add_argument("--farms", type=str, default="", help="List  of IDs' farms to be processed")
     args = parser.parse_args()
 
     print("=" * 80)
     print("[START] Ganabosques ETL pipeline (Shapefiles)")
     print(f"[ARGS] from_scratch={args.from_scratch}, n_workers={args.n_workers}, "
-          f"target_crs={args.target_crs}, plots_src_crs={args.plots_src_crs}")
+          f"target_crs={args.target_crs}, plots_src_crs={args.plots_src_crs}, "
+          f"deforestation={args.deforestation}, farms={args.farms}")
+
     print("=" * 80)
 
     ensure_folders(args.from_scratch)
@@ -548,10 +555,22 @@ def main():
             raise RuntimeError("Target shapefiles not found; run with --from-scratch to build them.")
         # load plots CSV into GDF
         df_plots = pd.read_csv(PLOTS_CSV)
-        plots_gdf = gpd.GeoDataFrame(df_plots[["id"]], geometry=gpd.GeoSeries.from_wkt(df_plots["geometry"]), crs=None)
+        plots_gdf = gpd.GeoDataFrame(df_plots[["id","farm_id","adm3_id"]], geometry=gpd.GeoSeries.from_wkt(df_plots["geometry"]), crs=None)
+
+    # Filtering plots
+    if args.farms:
+        id_list = [x.strip() for x in args.farms.split(",")]
+        print(f"[FLOW] Filtering plots {len(id_list)}")
+        plots_gdf = plots_gdf[plots_gdf["farm_id"].isin(id_list)]
 
     # Reproject plots to target CRS
+    print("[FLOW] Reprojecting plots to target CRS")
     plots_target = reproject_plots_gdf(plots_gdf, args.plots_src_crs, args.target_crs)
+    plots_target.to_file(PLOTS_TARGET_SHP_OUT)
+
+    # Filtering deforestation
+    if args.deforestation:
+        defo_items = [item for item in defo_items if item["id"].endswith(args.deforestation + ".tif")]
 
     print(f"[FLOW] Found {len(defo_items)} deforestation rasters to process.")
     for item in tqdm(defo_items, desc="Processing deforestation rasters"):
