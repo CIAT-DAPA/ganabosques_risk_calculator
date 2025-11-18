@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import zipfile
 from typing import Dict, List, Optional
@@ -35,7 +36,8 @@ from ganabosques_orm.collections.adm3 import Adm3
 from ganabosques_orm.collections.enterprise import Enterprise
 
 # Risk package
-from ganabosques_risk_package.plot_alert_direct import alert_direct
+#from ganabosques_risk_package.plot_alert_direct import alert_direct
+from ganabosques_risk_package.plot_alert_direct_serial import alert_direct_serial
 from ganabosques_risk_package.plot_alert_indirect import alert_indirect
 from ganabosques_risk_package.entity_alert import calculate_alert
 
@@ -473,13 +475,13 @@ def run_alerts_for_deforestation(plots_gdf_target_crs: gpd.GeoDataFrame,
 
     # Step 1: Direct
     print("[ALERT] Step 1: alert_direct() ...")
-    df_direct = alert_direct(
+    df_direct = alert_direct_serial(
         plots=plots_gdf_target_crs,
         deforestation=defo_item["raster_path"],
         protected_areas=protected_shp_target,
         farming_areas=farming_shp_target,
         deforestation_value=2,
-        n_workers=n_workers,
+        #n_workers=n_workers,
         id_column="farm_id"
     )
     df_direct.to_csv(alert_direct_csv, index=False)
@@ -487,12 +489,71 @@ def run_alerts_for_deforestation(plots_gdf_target_crs: gpd.GeoDataFrame,
 
     # Step 2: Indirect
     print("[ALERT] Step 2: alert_indirect() ...")
-    movement_files = [os.path.join(MOVEMENT_DIR, f) for f in os.listdir(MOVEMENT_DIR) if f.endswith(".csv")]
+    def_df = pd.read_csv(DEFORESTATION_CSV)
+    def_item = def_df[def_df["id"]==defo_item["id"]]
+
+    # Extraer period_start y period_end como timestamps
+    period_start = pd.to_datetime(def_item["period_start"].iloc[0])
+    period_end   = pd.to_datetime(def_item["period_end"].iloc[0])
+    start_year = period_start.year
+    end_year   = period_end.year
+
+    # ---------------------------------------------------------
+    # 1) Construir movement_files filtrando por años en el nombre del archivo
+    #    (sin función interna)
+    # ---------------------------------------------------------
+    movement_files = []
+    for fname in os.listdir(MOVEMENT_DIR):
+        if not fname.endswith(".csv"):
+            continue
+
+        # Intentar extraer un año YYYY del nombre del archivo
+        m = re.search(r"(\d{4})", fname)
+        if m is None:
+            continue
+
+        year = int(m.group(1))
+
+        # Solo considerar archivos cuyo año esté dentro del rango
+        if start_year <= year <= end_year:
+            movement_files.append(os.path.join(MOVEMENT_DIR, fname))
+    # ---------------------------------------------------------
+    # 1) Construir movement_files filtrando por años en el nombre del archivo
+    #    (sin función interna)
+    # ---------------------------------------------------------
+    movement_files = []
+    for fname in os.listdir(MOVEMENT_DIR):
+        if not fname.endswith(".csv"):
+            continue
+
+        # Intentar extraer un año YYYY del nombre del archivo
+        m = re.search(r"(\d{4})", fname)
+        if m is None:
+            continue
+
+        year = int(m.group(1))
+
+        # Solo considerar archivos cuyo año esté dentro del rango
+        if start_year <= year <= end_year:
+            movement_files.append(os.path.join(MOVEMENT_DIR, fname))
+
+
     movement_parts = []
     for f in tqdm(movement_files, desc="Loading movement files"):
-        dfm = pd.read_csv(f)
-        if {"origen_id", "destination_id"}.issubset(dfm.columns):
-            movement_parts.append(dfm[["origen_id", "destination_id"]])
+        # parse_dates para que 'date' ya quede como datetime
+        dfm = pd.read_csv(f, parse_dates=["date"])
+
+        # Verificar columnas necesarias
+        if not {"origen_id", "destination_id", "date"}.issubset(dfm.columns):
+            continue
+
+        # Filtro por rango de fechas [period_start, period_end]
+        mask = (dfm["date"] >= period_start) & (dfm["date"] <= period_end)
+        dfm_filtered = dfm.loc[mask, ["origen_id", "destination_id", "date"]]
+
+        if not dfm_filtered.empty:
+            movement_parts.append(dfm_filtered)
+
     movement_df = pd.concat(movement_parts) if movement_parts else pd.DataFrame(columns=["origen_id", "destination_id"])
     df_indirect = alert_indirect(df_direct, movement_df, n_workers)
     df_indirect.to_csv(alert_indirect_csv, index=False)
@@ -569,8 +630,9 @@ def main():
     plots_target.to_file(PLOTS_TARGET_SHP_OUT)
 
     # Filtering deforestation
+    #print(defo_items)
     if args.deforestation:
-        defo_items = [item for item in defo_items if item["id"].endswith(args.deforestation + ".tif")]
+        defo_items = [item for item in defo_items if item["id"] == args.deforestation]
 
     print(f"[FLOW] Found {len(defo_items)} deforestation rasters to process.")
     for item in tqdm(defo_items, desc="Processing deforestation rasters"):
