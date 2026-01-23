@@ -12,22 +12,23 @@ import pandas as pd
 from pymongo import MongoClient
 from bson import ObjectId
 
+#"2010-2011,2010-2012,2010-2013,2010-2014,2010-2015,2010-2016,2010-2017,2010-2018,2010-2019,2010-2020,2010-2021,2010-2022,2010-2023", #
+#"2010-2012,2012-2013,2013-2014,2014-2015,2015-2016,2016-2017,2017-2018,2018-2019,2019-2020,2020-2021,2021-2022,2022-2023,2023-2024"
 # ===================== CONFIG =====================
 config = {
     # Parámetros
-    "PERIODO": "cumulative",                         # "annual" o "cumulative"
-    "YEARS":   "2010-2021,2010-2022,2010-2023", # múltiple, separado por coma
-
+    "PERIODO": "annual",                         # "annual" o "cumulative"
+    "YEARS": "2010-2012,2012-2013,2013-2014,2014-2015,2015-2016,2016-2017,2017-2018,2018-2019,2019-2020,2020-2021,2021-2022,2022-2023,2023-2024", # múltiple, separado por coma
+     
     # Rutas (Windows; usa r'' para backslashes)
-    "DIRECT_DIR":   r"D:\OneDrive - CGIAR\Desktop\ganabosques\trabajo de alertas\alertas_direct\{PERIODO}\SMBYC\{YEARS}",
+    "DIRECT_DIR":   r"D:\OneDrive - CGIAR\Desktop\ganabosques\alertas\{PERIODO}\direct_alert\SMBYC\{YEARS}",
     "DIRECT_NAME":  "smbyc_direct_alert_{PERIODO}_{YEARS}.csv",
 
-    "MOVE_DIR":     r"D:\OneDrive - CGIAR\Desktop\ganabosques\trabajo de alertas\alertas_indirect\{PERIODO}\{YEARS}",
+    "MOVE_DIR":     r"D:\OneDrive - CGIAR\Desktop\ganabosques\alertas\{PERIODO}\indirect_alert\SMBYC\{YEARS}",
     "MOVE_NAME":    "smbyc_movement_alerts_{YEARS}.csv",
 
-    "METRICS_PATH": r"D:\OneDrive - CGIAR\Desktop\ganabosques\trabajo de alertas\metricas\spatial_metrics_smbyc.csv",
-
-    "OUTPUT_ROOT":  r"D:\OneDrive - CGIAR\Desktop\ganabosques\trabajo de alertas\alertas_totales",
+    "METRICS_PATH": r"D:\OneDrive - CGIAR\Desktop\ganabosques\alertas\metrics\metricas.csv",
+    "OUTPUT_ROOT":  r"D:\OneDrive - CGIAR\Desktop\ganabosques\alertas\result_alerts",
 
     # Mongo
     "MONGO_URI": "mongodb://localhost:27017",
@@ -73,23 +74,13 @@ def parse_years_list(raw: str) -> List[str]:
     return out
 
 def id_preserve_zeros(x) -> str:
-    """
-    Normaliza SUAVE:
-    - str + strip
-    - elimina sufijo '.0' si llegó de Excel
-    - NO elimina ceros a la izquierda
-    - NO cambia mayúsculas/minúsculas (no aplica a números)
-    """
     if x is None:
         return ""
     s = str(x).strip()
     if s.endswith(".0"):
         try:
-            # si realmente es entero .0 lo dejamos sin .0, PERO manteniendo ceros iniciales si los traía como string
             i = int(float(s))
             s2 = str(i)
-            # solo usar s2 si NO rompe un posible código con ceros iniciales
-            # regla: si el original tenía sólo dígitos y algún cero a la izquierda, mantenemos el original sin ".0"
             if re.fullmatch(r"\d+\.0", s):
                 return s[:-2]  # "000123.0" -> "000123"
             return s2
@@ -120,7 +111,7 @@ def map_id_to_farm_and_polygons(df_ids: pd.Series) -> Tuple[Dict[str, str], Dict
     """
     Devuelve dos diccionarios:
       id -> farm_id (ObjectId como string)
-      id -> farm_poligons_id (si hay varios, el primero; además guarda todos en 'all_polys' si quieres)
+      id -> farm_poligons_id (si hay varios, el primero)
     """
     ids = [id_preserve_zeros(x) for x in df_ids.dropna().astype(str).tolist()]
     ids = [i for i in ids if i != ""]
@@ -142,12 +133,10 @@ def map_id_to_farm_and_polygons(df_ids: pd.Series) -> Tuple[Dict[str, str], Dict
         cur = farm_col.find(q, {"_id": 1, "ext_id": 1})
         found = 0
         for doc in cur:
-            # localizar cuál ext_code del set matcheó
             ext = doc.get("ext_id", [])
             match_codes = [e.get("ext_code") for e in ext if isinstance(e, dict) and e.get("source") == "SIT_CODE" and e.get("ext_code") in chunk]
             if not match_codes:
                 continue
-            # puede haber más de uno; asignamos todos al mismo farm_id
             for code in match_codes:
                 if code not in id2farm:
                     id2farm[code] = doc["_id"]
@@ -251,10 +240,10 @@ def process_year(periodo: str, years: str, metrics_df: pd.DataFrame) -> Optional
     final["farm_id"] = final["id"].map(id2farm).fillna("")
     final["farm_poligons_id"] = final["id"].map(id2poly).fillna("")
 
-    # --- Guardar
+    # --- Guardar (CAMBIO DE NOMBRE DE ARCHIVO)
     out_dir = os.path.join(config["OUTPUT_ROOT"], periodo, years)
     ensure_dir(out_dir)
-    out_path = os.path.join(out_dir, f"alert_direct_indirect_metricas_{periodo}_{years}.csv")
+    out_path = os.path.join(out_dir, f"deforestation_{periodo}_{years}.csv")
     final.to_csv(out_path, index=False, encoding="utf-8")
     print(f"✅ Guardado: {out_path}")
     return out_path
