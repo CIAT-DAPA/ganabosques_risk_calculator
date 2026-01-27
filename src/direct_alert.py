@@ -578,14 +578,6 @@ def calculate_direct_alerts(
     console.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
     root.addHandler(console)
 
-    print("parametros recibidos:")
-    print(f"source={source}, period_type={period_type}, years={years}, farm_folder={farm_folder}")
-    print(f"raster_template={raster_template}, output_csv={output_csv}, alerts_dir={alerts_dir}, nucleos_dir={nucleos_dir}")
-    print(f"batch_size={batch_size}, farm_range={farm_range}, crs={crs}, deforest_value={deforest_value}")
-    print(f"log_level={log_level}, log_file={log_file}, use_precise_area={use_precise_area}")
-    print(f"raster_paths_dict keys={list(raster_paths_dict.keys()) if raster_paths_dict else None}")
-    print(f"_data_manager={_data_manager}, _farms_metadata count={len(_farms_metadata) if _farms_metadata else 0}, _farm_limit={_farm_limit}")
-    
     # Determinar opciones a procesar
     chosen: Set[int] = {1}  # Opción 1 (deforestación) siempre activa
     if alerts_dir:
