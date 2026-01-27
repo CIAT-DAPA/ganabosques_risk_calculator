@@ -33,28 +33,34 @@ config['CONNECTION_DB']  = config['MONGO_DB_NAME']
 config['CRS_METROS'] = os.getenv("CRS_METROS", "EPSG:3116")
 config['MAX_DIST'] = int(os.getenv("MAX_DIST", "50000"))
 config['DEFOREST_VALUE'] = int(os.getenv("DEFOREST_VALUE", "2"))
-config['EMPRESA'] = getenv_clean("EMPRESA")
-config['YEARS']   = getenv_clean("YEARS")
-config['PERIODO'] = getenv_clean("PERIODO")
-config['BATCH_SIZE'] = int(os.getenv("BATCH_SIZE", "12"))
+config['EMPRESA'] = os.getenv("EMPRESA", "default")  # Opcional con default
+config['YEARS']   = os.getenv("YEARS", "")  # Opcional, se pasa desde main.py
+config['PERIODO'] = os.getenv("PERIODO", "")  # Opcional, se pasa desde main.py
+config['BATCH_SIZE'] = int(os.getenv("BATCH_SIZE", "1000"))
 
-# --- Rutas (obligatorias) ---
-config['FOLDER_GEOJSONS'] = getenv_clean("FOLDER_GEOJSONS")
-config['RASTER_DEFOREST'] = getenv_clean("RASTER_DEFOREST")
+# --- Geoserver (nuevo) ---
+config['GEOSERVER_URL'] = os.getenv("GEOSERVER_URL", "")
+config['GEOSERVER_USER'] = os.getenv("GEOSERVER_USER", "admin")
+config['GEOSERVER_PASS'] = os.getenv("GEOSERVER_PASS", "geoserver")
+config['WORKSPACE_DIR'] = os.getenv("WORKSPACE_DIR", "./workspace")
+
+# --- Rutas (opcionales ahora, se manejan con DataManager) ---
+config['FOLDER_GEOJSONS'] = os.getenv("FOLDER_GEOJSONS", "")
+config['RASTER_DEFOREST'] = os.getenv("RASTER_DEFOREST", "")
 config['ALERTAS_DIR'] = os.getenv("ALERTAS_DIR", "").strip()
 config['NUCLEOS_DIR'] = os.getenv("NUCLEOS_DIR", "").strip()
-config['SHP_PROTECTED']   = getenv_clean("SHP_PROTECTED")
-config['OUTPUT_CSV']      = getenv_clean("OUTPUT_CSV")
-config['FARMING_FRONTIER_SHP'] = getenv_clean("FARMING_FRONTIER_SHP")
+config['SHP_PROTECTED']   = os.getenv("SHP_PROTECTED", "")
+config['OUTPUT_CSV']      = os.getenv("OUTPUT_CSV", "")
+config['FARMING_FRONTIER_SHP'] = os.getenv("FARMING_FRONTIER_SHP", "")
 
 # Logging (opcionales)
 config['LOG_LEVEL'] = os.getenv("LOG_LEVEL", "WARNING")
 config['LOG_FILE']  = os.getenv("LOG_FILE",  "risk_analysis_intersections.log")
 
-# --- Movement ---
-config['DIRECT_RISK_CSV'] = os.getenv("DIRECT_RISK_CSV", config['OUTPUT_CSV'])
-config['MOVEMENT_INPUT_CSV'] = getenv_clean("MOVEMENT_INPUT_CSV")
-config['MOVEMENT_RISK_OUTPUT_CSV'] = getenv_clean("MOVEMENT_RISK_OUTPUT_CSV")
+# --- Movement (opcionales) ---
+config['DIRECT_RISK_CSV'] = os.getenv("DIRECT_RISK_CSV", "")
+config['MOVEMENT_INPUT_CSV'] = os.getenv("MOVEMENT_INPUT_CSV", "")
+config['MOVEMENT_RISK_OUTPUT_CSV'] = os.getenv("MOVEMENT_RISK_OUTPUT_CSV", "")
 
 config['MERGE_OUTPUT'] = os.getenv("MERGE_OUTPUT", "false").lower() == "true"
 config['OUTPUT_CSV_ALL'] = os.getenv("OUTPUT_CSV_ALL", None)
@@ -65,8 +71,8 @@ config['TOTAL_ALERT_BASE_DIR'] = os.getenv("TOTAL_ALERT_BASE_DIR", None)
 config['SOURCES_AVAILABLE'] = os.getenv("SOURCES_AVAILABLE", None)
 config['EMPRESA_ALERT_OUT_DIR'] = os.getenv("EMPRESA_ALERT_OUT_DIR", None)
 
-# Total Risk
-config['TOTAL_RISK_OUTPUT_CSV'] = getenv_clean("TOTAL_RISK_OUTPUT_CSV")
+# Total Risk (opcionales)
+config['TOTAL_RISK_OUTPUT_CSV'] = os.getenv("TOTAL_RISK_OUTPUT_CSV", "")
 config['MERGE_TOTAL_OUTPUT'] = os.getenv("MERGE_TOTAL_OUTPUT", "false").lower() == "true"
 config['TOTAL_RISK_OUTPUT_ALL'] = os.getenv("TOTAL_RISK_OUTPUT_ALL", None)
 
