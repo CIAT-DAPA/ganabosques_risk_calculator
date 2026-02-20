@@ -1,27 +1,43 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+⚠️  ARCHIVO DEPRECADO - NO USAR ⚠️
+
+Este archivo ha sido reemplazado por la versión refactorizada que es más modular
+y se integra mejor con el pipeline de main.py.
+
+Usar en su lugar: indirect_alert_refactored.py
+
+Fecha de deprecación: Enero 2026
+"""
+
+import warnings
+warnings.warn(
+    "indirect_alert.py está DEPRECADO. Usar indirect_alert_refactored.py en su lugar.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 import os
 import re
 import logging
 import pandas as pd
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== CONFIG =====================
 config = {
     "PERIODO": "annual",
-    "YEARS":   "2010-2012",   # puedes poner varios separados por coma
-    "YEAR_MOV": "2010",
-
-    # Rutas (tu estructura actual)
-    "OUTPUT_CSV": "/opt/ganabosques/test_buffers/data_server/alertas/{PERIODO}/direct_alert/SMBYC/{PERIODO}/{YEARS}",
+    "YEARS":   "2010-2012,2012-2013,2013-2014,2014-2015,2015-2016,2016-2017,2017-2018,2018-2019,2019-2020,2020-2021,2021-2022,2022-2023,2023-2024",   # puedes poner varios separados por coma
+    "YEAR_MOV": "2010,2012,2013,2014,2015,2016,2017,2018,2019,2020,2021,2022,2023",
+    
+    
+    "OUTPUT_CSV": "/opt/ganabosques/test_buffers/data_server/alertas/{PERIODO}/direct_alert/SMBYC/{YEARS}",
     "MOVEMENT_INPUT_CSV": "/opt/ganabosques/test_buffers/data_server/movement/movement_data_base_{YEAR_MOV}.csv",
-    "MOVEMENT_RISK_OUTPUT_CSV": "/opt/ganabosques/test_buffers/data_server/alertas_indirect/{PERIODO}/{YEARS}",
+    "MOVEMENT_RISK_OUTPUT_CSV": "/opt/ganabosques/test_buffers/data_server/alertas/{PERIODO}/indirect_alert/SMBYC/{YEARS}",
 
-    # Normalización de IDs (ajústalo si tu data lo requiere)
-    "ID_STRIP_DOT_ZERO": True,      # convierte "123.0" -> "123"
-    "ID_STRIP_LEADING_ZEROS": True, # "00123" -> "123" (solo si es numérico)
+    "ID_STRIP_DOT_ZERO": True,      # "123.0" -> "123"
+    "ID_STRIP_LEADING_ZEROS": True, # "00123" -> "123" (si es numérico)
     "ID_UPPERCASE": True,           # "ab-01" -> "AB-01"
 
     "LOG_LEVEL": "INFO",
@@ -42,6 +58,10 @@ def setup_logging():
 
 # ===================== UTILIDADES =====================
 def parse_year_periods(years_raw: str) -> List[str]:
+    """
+    Convierte '2010-2012, 2012-2013' -> ['2010-2012','2012-2013']
+    Valida formato AAAA-AAAA.
+    """
     if not years_raw:
         return []
     parts = [p.strip() for p in str(years_raw).split(",") if p.strip()]
@@ -53,7 +73,28 @@ def parse_year_periods(years_raw: str) -> List[str]:
             logging.warning(f"YEARS ignorado por formato no válido: '{p}' (usa AAAA-AAAA)")
     return valids
 
+def parse_mov_years(mov_raw: str) -> List[str]:
+    """
+    Convierte '2010, 2012,2013' -> ['2010','2012','2013']
+    Valida formato AAAA.
+    """
+    if not mov_raw:
+        return []
+    years = []
+    for tok in str(mov_raw).split(","):
+        y = tok.strip()
+        if y:
+            if re.match(r"^\d{4}$", y):
+                years.append(y)
+            else:
+                logging.warning(f"YEAR_MOV ignorado por formato no válido: '{y}' (usa AAAA)")
+    return years
+
 def derive_mov_year(years_range: str, periodo: str) -> str:
+    """
+    Si PERIODO es annual/anual -> usa primer año del rango.
+    Si es cumulative/acumulado -> usa último año del rango.
+    """
     if not years_range or "-" not in years_range:
         return str(years_range or "")
     first_year, last_year = years_range.split("-", 1)
@@ -99,6 +140,9 @@ def ensure_dir(p: str):
 def load_smbyc_alerts(output_base_template: str,
                       periodo: str, years: str,
                       mov_year: str, year_mov: str) -> pd.DataFrame:
+    """
+    Carga CSV de alertas directas y devuelve DataFrame con columnas: id, direct_alert (bool)
+    """
     alerts_dir = format_placeholders(output_base_template, {
         "PERIODO": periodo, "YEARS": years,
         "MOV_YEAR": mov_year, "YEAR_MOV": year_mov
@@ -133,6 +177,10 @@ def load_smbyc_alerts(output_base_template: str,
 
 # ===================== MOVIMIENTOS =====================
 def build_movement_counts(mov_path: str, alert_ids_bool: Dict[str, bool]) -> pd.DataFrame:
+    """
+    Lee el CSV de movimientos, normaliza IDs y calcula n_in, n_out,
+    n_indirect_in/out, indirect_alert_in/out y n_total_mov para IDs en alertas.
+    """
     df_mov = pd.read_csv(mov_path, dtype=str, low_memory=False)
 
     # Columnas aceptadas
@@ -190,12 +238,16 @@ def build_movement_counts(mov_path: str, alert_ids_bool: Dict[str, bool]) -> pd.
     out["indirect_alert_out"] = out["n_indirect_out"] > 0
     return out
 
-# ===================== PIPELINE (solo SMBYC) =====================
-def process_year(years: str, periodo: str, year_mov_override: Optional[str]) -> Optional[str]:
+# ===================== PIPELINE (SMBYC) =====================
+def process_year(years: str, periodo: str, year_mov_value: Optional[str]) -> Optional[str]:
+    """
+    Ejecuta el pipeline para un par (YEARS, YEAR_MOV). Si YEAR_MOV es None o vacío,
+    se deriva desde YEARS y PERIODO.
+    """
     print(f"▶️ Iniciando SMBYC {years} ({periodo})")
 
     mov_year = derive_mov_year(years, periodo)
-    year_mov = (year_mov_override or "").strip() or mov_year
+    year_mov = (year_mov_value or "").strip() or mov_year
 
     # 1) Cargar alertas directas
     alerts_df = load_smbyc_alerts(config["OUTPUT_CSV"], periodo, years, mov_year, year_mov)
@@ -216,7 +268,10 @@ def process_year(years: str, periodo: str, year_mov_override: Optional[str]) -> 
     # 3) Calcular
     result_df = build_movement_counts(movement_path, alert_ids_bool)
 
-    # 4) Guardar salida
+    # 4) Guardar salida (agrega columnas de auditoría)
+    result_df.insert(0, "years_range", years)
+    result_df.insert(1, "year_mov_used", year_mov)
+
     out_dir = format_placeholders(config["MOVEMENT_RISK_OUTPUT_CSV"], {
         "PERIODO": periodo, "YEARS": years, "MOV_YEAR": mov_year, "YEAR_MOV": year_mov
     })
@@ -235,13 +290,37 @@ def main():
     periodo = str(config.get("PERIODO","")).strip()
     years_cfg = str(config.get("YEARS","")).strip()
     years_list = parse_year_periods(years_cfg)
-    year_mov_override = str(config.get("YEAR_MOV","")).strip() or None
 
-    # Paraleliza por años (solo SMBYC)
+    # NUEVO: lista de YEAR_MOV, 1 a 1 con YEARS
+    mov_list_cfg = str(config.get("YEAR_MOV","")).strip()
+    mov_list = parse_mov_years(mov_list_cfg)
+
+    if not years_list:
+        print("⚠ No hay rangos válidos en config['YEARS'] (usa 'AAAA-AAAA' separados por coma).")
+        return
+
+    # Aviso por desbalance
+    if mov_list and len(mov_list) != len(years_list):
+        logging.warning(
+            f"Desbalance YEARS ({len(years_list)}) vs YEAR_MOV ({len(mov_list)}). "
+            f"Se emparejarán por índice; si faltan YEAR_MOV, se usará derive_mov_year()."
+        )
+
+    # Emparejar por índice con fallback a derive_mov_year()
+    pairs: List[Tuple[str, Optional[str]]] = []
+    for i, years in enumerate(years_list):
+        ym = mov_list[i] if i < len(mov_list) else None
+        if ym is None:
+            fallback = derive_mov_year(years, periodo)
+            logging.info(f"No hay YEAR_MOV para '{years}', usando derive_mov_year → {fallback}")
+            ym = fallback
+        pairs.append((years, ym))
+
+    # Paraleliza por pares (YEARS ↔ YEAR_MOV)
     tasks = []
     with ThreadPoolExecutor(max_workers=config["MAX_WORKERS"]) as executor:
-        for years in years_list:
-            tasks.append(executor.submit(process_year, years, periodo, year_mov_override))
+        for years, year_mov in pairs:
+            tasks.append(executor.submit(process_year, years, periodo, year_mov))
 
         results = []
         for future in as_completed(tasks):

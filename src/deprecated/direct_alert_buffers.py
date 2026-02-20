@@ -1,3 +1,20 @@
+# DEPRECATED: Este archivo no debe usarse - usar direct_alert.py
+"""
+⚠️  ARCHIVO DEPRECADO - NO USAR ⚠️
+
+Este archivo es una variante con buffers que no se usa en producción.
+Usar en su lugar: direct_alert.py
+
+Fecha de deprecación: Enero 2026
+"""
+
+import warnings
+warnings.warn(
+    "direct_alert_buffers.py está DEPRECADO. Usar direct_alert.py en su lugar.",
+    DeprecationWarning,
+    stacklevel=2
+)
+
 # JUPYTER-FRIENDLY VERSION (sin argparse / sin .env / sin config.py / SIN tqdm)
 
 import os, re, gc, time, logging

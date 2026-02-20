@@ -47,8 +47,12 @@ def process_farm_chunk(args: tuple) -> Dict[str, Any]:
     chunk_params['farm_folder'] = params['farm_folder']
     chunk_params['farm_range'] = ''  # Procesar todos los files del chunk
     
-    # Remover parámetros internos (que empiezan con _)
+    # Remover parámetros internos (que empiezan con _) EXCEPTO los necesarios
     clean_params = {k: v for k, v in chunk_params.items() if not k.startswith('_')}
+    
+    # Asegurar que raster_paths_dict se pase (no empieza con _ pero es crítico)
+    if 'raster_paths_dict' in params:
+        clean_params['raster_paths_dict'] = params['raster_paths_dict']
     
     # Crear symlinks/copiar solo los geojsons de este chunk
     chunk_geojson_dir = temp_dir / "geojsons"
@@ -170,7 +174,8 @@ def run_parallel_direct_alerts(
     start_time = time.time()
     
     if num_workers is None:
-        num_workers = cpu_count()
+        available_cores = cpu_count()
+        num_workers = min(available_cores, 4)
     
     print(f"\n🚀 MODO PARALELO: {num_workers} workers")
     print("=" * 70)
@@ -248,27 +253,20 @@ def run_parallel_direct_alerts(
     temp_dirs = [r['temp_dir'] for r in successful]
     years_list = params['years']
     source = params['source']
+    period_type = params['period_type']
     output_template = params['output_csv']
     
     combined_stats = {}
     
     for period in years_list:
-        # Formatear output_csv para este período
-        ctx = {'PERIODO': params['period_type'], 'YEARS': period}
-        
-        # Determinar ruta de salida final
+        # Formatear output_csv para este período usando nueva estructura de carpetas
+        # results/{source}/{deforestation_type}/direct_alerts/{period}/
         from direct_alert import make_out_dir_and_paths, norm, format_placeholders
         
-        formatted = norm(format_placeholders(output_template, ctx))
-        base_dir = os.path.dirname(formatted) or "."
+        ctx = {'PERIODO': period_type, 'YEARS': period}
         
-        option_map = {"smbyc": "SMBYC", "atd": "ATD", "nad": "NAD", "otra": "OTRA"}
-        option_folder = option_map.get(str(source).lower(), str(source).upper())
-        
-        out_dir = norm(os.path.join(base_dir, option_folder, period))
-        os.makedirs(out_dir, exist_ok=True)
-        
-        final_csv = norm(os.path.join(out_dir, f"{source}_direct_alert_{params['period_type']}_{period}.csv"))
+        # Usar make_out_dir_and_paths con la nueva firma que incluye deforestation_type
+        out_dir, final_csv = make_out_dir_and_paths(output_template, ctx, source, deforestation_type=period_type)
         
         # Combinar CSVs de este período
         num_records = combine_csv_results(temp_dirs, final_csv, period, source)
@@ -298,4 +296,161 @@ def run_parallel_direct_alerts(
         'farms_per_period': total_farms,
         'execution_time': total_time,
         'combined_stats': combined_stats
+    }
+
+
+# ===================== PARALELIZACIÓN DE MÉTRICAS ESPACIALES =====================
+
+def process_metrics_chunk(args: tuple) -> Dict[str, Any]:
+    """
+    Procesa un chunk de farms para métricas espaciales en un worker.
+    
+    Args:
+        args: Tupla con (chunk_id, farm_ids, params)
+        
+    Returns:
+        Dict con resultados del chunk
+    """
+    chunk_id, farm_ids, params = args
+    
+    # Importar aquí para evitar problemas de serialización
+    from spatial_metrics import compute_metrics_for_farms, area_ha
+    import geopandas as gpd
+    
+    try:
+        # Obtener parámetros
+        geometries_cache = params.get('_geometries_cache', {})
+        frontier_gdf = params.get('_frontier_gdf')
+        protected_gdf = params.get('_protected_gdf')
+        crs = params.get('crs', 'EPSG:3116')
+        
+        # Crear GeoDataFrame desde cache para este chunk
+        rows = []
+        for farm_id in farm_ids:
+            geom = geometries_cache.get(farm_id)
+            if geom:
+                rows.append({'id': farm_id, 'geometry': geom})
+        
+        if not rows:
+            return {
+                'chunk_id': chunk_id,
+                'success': False,
+                'error': 'No geometries found in cache',
+                'results': []
+            }
+        
+        farms_gdf = gpd.GeoDataFrame(rows, crs=crs)
+        
+        # Calcular métricas
+        metrics_df = compute_metrics_for_farms(farms_gdf, frontier_gdf, protected_gdf)
+        
+        return {
+            'chunk_id': chunk_id,
+            'success': True,
+            'results': metrics_df.to_dict('records'),
+            'farms_processed': len(metrics_df)
+        }
+        
+    except Exception as e:
+        import logging
+        logging.error(f"Error en chunk de métricas {chunk_id}: {e}")
+        return {
+            'chunk_id': chunk_id,
+            'success': False,
+            'error': str(e),
+            'results': []
+        }
+
+
+def run_parallel_spatial_metrics(
+    params: Dict[str, Any],
+    num_workers: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    Ejecuta cálculo de métricas espaciales en paralelo.
+    
+    Args:
+        params: Parámetros incluyendo _geometries_cache, _frontier_gdf, _protected_gdf
+        num_workers: Número de workers (None = usar CPUs disponibles, max 4)
+        
+    Returns:
+        Dict con resultados y estadísticas
+    """
+    start_time = time.time()
+    
+    if num_workers is None:
+        available_cores = cpu_count()
+        num_workers = min(available_cores, 4)
+    
+    print(f"\n🚀 MÉTRICAS PARALELAS: {num_workers} workers")
+    print("=" * 70)
+    
+    # Obtener IDs de farms desde el caché
+    geometries_cache = params.get('_geometries_cache', {})
+    if not geometries_cache:
+        return {
+            'success': False,
+            'error': 'No geometry cache available'
+        }
+    
+    all_farm_ids = list(geometries_cache.keys())
+    total_farms = len(all_farm_ids)
+    print(f"📊 Total de farms a procesar: {total_farms:,}")
+    
+    # Dividir en chunks
+    chunk_size = (total_farms + num_workers - 1) // num_workers
+    chunks = []
+    
+    for i in range(num_workers):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, total_farms)
+        
+        if start_idx >= total_farms:
+            break
+        
+        chunk_ids = all_farm_ids[start_idx:end_idx]
+        chunks.append((i, chunk_ids, params))
+        print(f"  • Worker {i+1}: {len(chunk_ids):,} farms")
+    
+    print(f"\n⚙️ Procesando {len(chunks)} chunks en paralelo...")
+    
+    # Procesar chunks en paralelo
+    results = []
+    
+    with Pool(processes=num_workers) as pool:
+        with tqdm(total=len(chunks), desc="Workers completados", unit="chunk") as pbar:
+            for result in pool.imap_unordered(process_metrics_chunk, chunks):
+                results.append(result)
+                pbar.update(1)
+    
+    # Combinar resultados
+    successful = [r for r in results if r.get('success', False)]
+    failed = [r for r in results if not r.get('success', False)]
+    
+    print(f"\n✅ Workers exitosos: {len(successful)}/{len(chunks)}")
+    if failed:
+        print(f"❌ Workers fallidos: {len(failed)}")
+        for f in failed:
+            print(f"   • Chunk {f['chunk_id']}: {f.get('error', 'Unknown error')}")
+    
+    # Combinar todos los resultados en un DataFrame
+    all_rows = []
+    for r in successful:
+        all_rows.extend(r.get('results', []))
+    
+    combined_df = pd.DataFrame(all_rows)
+    
+    total_time = time.time() - start_time
+    
+    print(f"\n🎉 Métricas paralelas completadas en {total_time:.2f}s ({total_time/60:.1f} min)")
+    print(f"   • Farms procesados: {len(combined_df):,}")
+    
+    return {
+        'success': True,
+        'num_workers': num_workers,
+        'chunks_processed': len(successful),
+        'chunks_failed': len(failed),
+        'farms_processed': len(combined_df),
+        'execution_time': total_time,
+        'results_df': combined_df
     }

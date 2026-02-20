@@ -1,5 +1,20 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+⚠️  ARCHIVO DEPRECADO - NO USAR ⚠️
+
+Este archivo es una variante con buffers que no se usa en producción.
+Usar en su lugar: total_alert.py
+
+Fecha de deprecación: Enero 2026
+"""
+
+import warnings
+warnings.warn(
+    "total_alert_buffers.py está DEPRECADO. Usar total_alert.py en su lugar.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 import os
 import re

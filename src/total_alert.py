@@ -15,11 +15,15 @@ from tqdm import tqdm
 
 from config import config
 
-# --- MONGO
+# --- ORM (preferido) o fallback sin conexión
 try:
-    from pymongo import MongoClient
+    from ganabosques_orm.collections.farm import Farm
+    from ganabosques_orm.collections.farmpolygons import FarmPolygons
+    HAS_ORM = True
 except ImportError:
-    MongoClient = None  # permite correr sin pymongo (deja columnas vacías)
+    HAS_ORM = False
+    Farm = None
+    FarmPolygons = None
 
 # ===================== logging =====================
 def setup_logging():
@@ -35,11 +39,16 @@ def setup_logging():
     logging.getLogger().addHandler(console)
 
 # ===================== normalización de IDs =====================
+_FARM_ID_PREFIX = re.compile(r'^FARM_ID_', re.IGNORECASE)
+
 def _norm_id(s) -> str:
-    """Normaliza IDs: str + trim, elimina '.0', quita ceros a la izquierda si es numérico, upper()."""
+    """Normaliza IDs: str + trim, quita prefijo FARM_ID_, elimina '.0',
+    quita ceros a la izquierda si es numérico, upper()."""
     if s is None:
         return ""
     s = str(s).strip()
+    # Quitar prefijo FARM_ID_ (viene de geojsons de cacao/geofarmer)
+    s = _FARM_ID_PREFIX.sub('', s)
     if s.endswith(".0"):
         try:
             s = str(int(float(s)))
@@ -50,7 +59,7 @@ def _norm_id(s) -> str:
             s = str(int(s))
         except Exception:
             s = s.lstrip("0") or "0"
-    return s.upper()
+    return s
 
 # ===================== placeholders =====================
 def parse_year_periods(years_raw: str) -> List[str]:
@@ -348,112 +357,132 @@ def load_or_build_cache(empresa: str, periodo: str,
 # ===================== MONGO: utilidades de mapeo (CON PRINTS) =====================
 def build_mongo_maps(ids_needed: Set[str]) -> pd.DataFrame:
     """
-    Mapea: id (CSV normalizado) -> farm._id -> farmpolygons._id
-    Usa $elemMatch sobre ext_id para asegurar que source y ext_code
-    provienen del MISMO elemento del array.
+    Mapea: id (sitcode CSV) -> farm._id -> farmpolygons._id
+    Usa el ORM de ganabosques para consultar MongoDB.
+    
+    Esta función es un fallback cuando no se pasa mongo_map_df desde DataManager.
     """
     cols = ["id", "farm_id", "farm_poligons_id"]
     if not ids_needed:
-        print("MONGO ▶ No hay ids_needed")
+        print("ORM ▶ No hay ids_needed")
         return pd.DataFrame(columns=cols)
 
     # ids normalizados (strings tipo "396204")
     ids_str = [_norm_id(x) for x in ids_needed if _norm_id(x) != ""]
     ids_str = list(dict.fromkeys(ids_str))  # únicos y orden estable
 
-    # misma lista pero como enteros (por si ext_code está numérico en Mongo)
-    ids_int = []
-    for s in ids_str:
-        if s.isdigit():
-            try:
-                ids_int.append(int(s))
-            except Exception:
-                pass
-    ids_any = list(dict.fromkeys(ids_str + ids_int))
+    print(f"ORM ▶ IDs a buscar: {len(ids_str)} (ejemplos: {ids_str[:8]})") 
 
-    print(f"MONGO ▶ ids_str={len(ids_str)} | ids_int={len(ids_int)} (ejemplos str: {ids_str[:8]})")
-
-    if MongoClient is None:
-        logging.warning("pymongo no está instalado; columnas vacías.")
-        print("MONGO ▶ pymongo no disponible, devolviendo columnas vacías.")
+    if not HAS_ORM:
+        logging.warning("ganabosques_orm no está instalado; columnas vacías.")
+        print("ORM ▶ ganabosques_orm no disponible, devolviendo columnas vacías.")
         return pd.DataFrame({"id": ids_str, "farm_id": "", "farm_poligons_id": ""})
 
-    MONGO_URI      = str(config.get("MONGO_URI", "mongodb://localhost:27017")).strip()
-    MONGO_DB       = str(config.get("MONGO_DB_NAME", "ganabosques")).strip()
-    MONGO_SRC_NAME = str(config.get("MONGO_EXT_SOURCE", "SIT_CODE")).strip()
-    FARMS_COL      = str(config.get("MONGO_FARMS_COLLECTION", "farm")).strip()
-    POLYS_COL      = str(config.get("MONGO_FARMPOLYGONS_COLLECTION", "farmpolygons")).strip()
-
-    print(f"MONGO ▶ Conectando a {MONGO_URI} / db='{MONGO_DB}' | farms='{FARMS_COL}' | polys='{POLYS_COL}' | source='{MONGO_SRC_NAME}'")
+    print("ORM ▶ Consultando farms por SIT_CODE y GEOFARMER_ID...")
+    
     try:
-        client = MongoClient(MONGO_URI)
-        db = client[MONGO_DB]
-        farms_col = db[FARMS_COL]
-        polys_col = db[POLYS_COL]
-    except Exception as e:
-        logging.warning(f"No se pudo conectar a Mongo ({e}); columnas vacías.")
-        print(f"MONGO ▶ ERROR de conexión: {e}")
-        return pd.DataFrame({"id": ids_str, "farm_id": "", "farm_poligons_id": ""})
-
-    # ------- 1) FARMS: $elemMatch sobre ext_id
-    query = {"ext_id": {"$elemMatch": {"source": MONGO_SRC_NAME, "ext_code": {"$in": ids_any}}}}
-    proj  = {"_id": 1, "ext_id": 1}
-    print(f"MONGO ▶ Query farms: {query}")
-    farm_docs = list(farms_col.find(query, proj))
-    print(f"MONGO ▶ farms encontrados: {len(farm_docs)}")
-
-    # ext_code(normalizado) -> farm._id
-    farm_map: Dict[str, Any] = {}
-    for doc in farm_docs:
-        for ext in doc.get("ext_id", []):
-            if ext.get("source") == MONGO_SRC_NAME:
-                code = _norm_id(ext.get("ext_code"))
-                if code in ids_str and code not in farm_map:
-                    farm_map[code] = doc.get("_id")
-
-    # Prints de diagnóstico de mapeo
-    print(f"MONGO ▶ mapeos id->farm_id: {len(farm_map)} (ejemplos: {list(farm_map.items())[:5]})")
-
-    farm_ids = [v for v in set(farm_map.values()) if v is not None]
-    print(f"MONGO ▶ farm_ids únicos: {len(farm_ids)}")
-
-    # ------- 2) FARMPOLYGONS: farm_id -> farmpolygons._id
-    if farm_ids:
-        polygon_docs = list(polys_col.find({"farm_id": {"$in": farm_ids}}, {"_id": 1, "farm_id": 1}))
-    else:
-        polygon_docs = []
-    print(f"MONGO ▶ farmpolygons encontrados: {len(polygon_docs)}")
-
-    # Si hay múltiples polígonos por farm_id, tomamos el primero (ajustable)
-    polygon_map: Dict[Any, Any] = {}
-    for d in polygon_docs:
-        fid = d.get("farm_id")
-        if fid is not None and fid not in polygon_map:
-            polygon_map[fid] = d.get("_id")
-    print(f"MONGO ▶ mapeos farm_id->farmpoligons_id: {len(polygon_map)} (ejemplos: {list(polygon_map.items())[:5]})")
-
-    # ------- 3) DF final (+ prints de matched/unmatched)
-    rows = []
-    matched = 0
-    unmatched_ids = []
-    for sid in ids_str:
-        f_id = farm_map.get(sid)
-        if f_id:
-            matched += 1
+        # ------- 1) FARMS: buscar por ext_id.source=SIT_CODE o GEOFARMER_ID
+        # Primero intentar SIT_CODE (livestock)
+        farms_sit = Farm.objects(
+            ext_id__source="SIT_CODE",
+            ext_id__ext_code__in=ids_str
+        ).only('id', 'ext_id')
+        
+        # Construir mapeo code -> farm._id
+        farm_map: Dict[str, str] = {}
+        farm_ids = []
+        
+        for farm in farms_sit:
+            farm_id = str(farm.id)
+            farm_ids.append(farm.id)
+            
+            if farm.ext_id:
+                for ext in farm.ext_id:
+                    try:
+                        source_str = ext.source.value if hasattr(ext.source, 'value') else str(ext.source)
+                        if source_str == "SIT_CODE":
+                            code = _norm_id(str(ext.ext_code))
+                            if code in ids_str and code not in farm_map:
+                                farm_map[code] = farm_id
+                    except Exception:
+                        continue
+        
+        # Buscar IDs no encontrados por GEOFARMER_ID (cacao)
+        missing_ids = [sid for sid in ids_str if sid not in farm_map]
+        if missing_ids:
+            # Los ext_code en BD pueden tener prefijo FARM_ID_ que _norm_id quita,
+            # así que buscamos con ambas variantes
+            search_ids = list(set(missing_ids + [f"FARM_ID_{sid}" for sid in missing_ids]))
+            farms_geo = Farm.objects(
+                ext_id__source="GEOFARMER_ID",
+                ext_id__ext_code__in=search_ids
+            ).only('id', 'ext_id')
+            
+            for farm in farms_geo:
+                farm_id = str(farm.id)
+                if farm.id not in farm_ids:
+                    farm_ids.append(farm.id)
+                
+                if farm.ext_id:
+                    for ext in farm.ext_id:
+                        try:
+                            source_str = ext.source.value if hasattr(ext.source, 'value') else str(ext.source)
+                            if source_str == "GEOFARMER_ID":
+                                code = _norm_id(str(ext.ext_code))
+                                if code in ids_str and code not in farm_map:
+                                    farm_map[code] = farm_id
+                        except Exception:
+                            continue
+        
+        print(f"ORM ▶ farms encontrados: {len(farm_ids)}")
+        print(f"ORM ▶ mapeos code->farm_id: {len(farm_map)} (ejemplos: {list(farm_map.items())[:5]})")
+        
+        # ------- 2) FARMPOLYGONS: farm_id -> farmpolygons._id
+        polygon_map: Dict[str, str] = {}
+        
+        if farm_ids:
+            polygons = FarmPolygons.objects(farm_id__in=farm_ids).only('id', 'farm_id')
+            
+            for poly in polygons:
+                farm_oid = poly.farm_id.id if hasattr(poly.farm_id, 'id') else poly.farm_id
+                farm_id_str = str(farm_oid)
+                if farm_id_str not in polygon_map:
+                    polygon_map[farm_id_str] = str(poly.id)
+            
+            print(f"ORM ▶ farmpolygons encontrados: {len(polygon_map)}")
         else:
-            unmatched_ids.append(sid)
-        fp_id = polygon_map.get(f_id, "") if f_id else ""
-        rows.append({
-            "id": sid,
-            "farm_id": str(f_id) if f_id else "",
-            "farm_poligons_id": str(fp_id) if fp_id else ""
-        })
-
-    print(f"MONGO ▶ ids totales={len(ids_str)} | ids con farm_id={matched} | ids sin match={len(unmatched_ids)}")
-    if unmatched_ids:
-        print(f"MONGO ▶ ejemplos sin match: {unmatched_ids[:10]}")
-
-    return pd.DataFrame(rows, columns=cols)
+            print("ORM ▶ No hay farm_ids para buscar polygons")
+        
+        # ------- 3) Construir DataFrame final
+        rows = []
+        matched = 0
+        unmatched_ids = []
+        
+        for sid in ids_str:
+            f_id = farm_map.get(sid, "")
+            if f_id:
+                matched += 1
+                fp_id = polygon_map.get(f_id, "")
+            else:
+                unmatched_ids.append(sid)
+                fp_id = ""
+            
+            rows.append({
+                "id": sid,
+                "farm_id": f_id,
+                "farm_poligons_id": fp_id
+            })
+        
+        print(f"ORM ▶ ids totales={len(ids_str)} | con farm_id={matched} | sin match={len(unmatched_ids)}")
+        if unmatched_ids:
+            print(f"ORM ▶ ejemplos sin match: {unmatched_ids[:10]}")
+        
+        return pd.DataFrame(rows, columns=cols)
+        
+    except Exception as e:
+        logging.error(f"Error consultando MongoDB via ORM: {e}")
+        print(f"ORM ▶ ERROR: {e}")
+        return pd.DataFrame({"id": ids_str, "farm_id": "", "farm_poligons_id": ""})
 
 # ===================== proceso por fuente/año =====================
 def process_year_source(empresa: str, periodo: str, years: str, mov_year: str,
@@ -639,3 +668,205 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ===================== NUEVA API CALLABLE =====================
+def calculate_total_risk(
+    source: str,
+    period_type: str,
+    periods: List[str],
+    workspace_dir: str,
+    use_precalculated_metrics: bool = True,
+    mongo_map_df: Optional[pd.DataFrame] = None
+) -> Dict[str, Any]:
+    """
+    Calcula el riesgo total consolidando alertas directas, indirectas y métricas espaciales.
+    
+    Esta función es la nueva API que puede llamarse desde main.py con parámetros explícitos,
+    en lugar de depender de variables de entorno.
+    
+    Args:
+        source: Fuente de deforestación ('smbyc')
+        period_type: Tipo de período ('nad', 'atd', 'annual', 'cumulative')
+        periods: Lista de períodos a procesar (ej: ['201701', '201702'])
+        workspace_dir: Directorio base del workspace (ej: 'D:/data/alertas')
+        use_precalculated_metrics: Si True, usa spatial_metrics.csv precalculado
+        mongo_map_df: DataFrame precargado con mapeo id->farm_id->farm_polygon_id (opcional).
+                      Si se proporciona, evita consulta adicional a MongoDB.
+        
+    Returns:
+        Dict con estadísticas: {
+            'success': bool,
+            'periods_processed': int,
+            'files_generated': List[str],
+            'execution_time': float
+        }
+    """
+    from pathlib import Path
+    import time
+    
+    setup_logging()
+    T0 = time.perf_counter()
+    
+    workspace = Path(workspace_dir)
+    
+    # Nueva estructura: results/{source}/{period_type}/{stage}/
+    results_base = workspace / "results"
+    direct_alerts_dir = results_base / source / period_type / "direct_alerts"
+    indirect_alerts_dir = results_base / source / period_type / "indirect_alerts"
+    # spatial_metrics.py guarda en workspace/metrics/ no en results/spatial_metrics/
+    metrics_file = workspace / "metrics" / "spatial_metrics.csv"
+    output_dir = results_base / source / period_type / "total_risk"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Cargar métricas precalculadas si existen
+    metrics_df = None
+    if use_precalculated_metrics and metrics_file.exists():
+        print(f"📂 Cargando métricas precalculadas: {metrics_file}")
+        try:
+            metrics_df = pd.read_csv(metrics_file, dtype=str)
+            metrics_df["id"] = metrics_df["id"].apply(_norm_id)
+            print(f"✅ Métricas cargadas: {len(metrics_df)} farms")
+        except Exception as e:
+            print(f"⚠ Error cargando métricas: {e}")
+            metrics_df = None
+    
+    if metrics_df is None:
+        print("⚠ No hay métricas precalculadas. Ejecuta --metrics primero para mejor rendimiento.")
+        # Crear DataFrame vacío con columnas esperadas
+        metrics_df = pd.DataFrame(columns=[
+            'id', 'farming_in_ha', 'farming_in_prop', 
+            'farming_out_ha', 'farming_out_prop',
+            'protected_ha', 'protected_prop'
+        ])
+    
+    # Construir mapeo MongoDB
+    print("📊 Construyendo mapeo MongoDB (farm_id, farm_poligons_id)...")
+    
+    # Recopilar todos los IDs de los CSVs de alertas
+    all_ids = set()
+    
+    for period in periods:
+        print(f"🔍 Escaneando IDs en alertas para período: {period}")
+        # Buscar alertas directas
+        direct_csv = direct_alerts_dir / f"{source}_direct_alert_{period_type}_{period}.csv"
+        if direct_csv.exists():
+            try:
+                df = pd.read_csv(direct_csv, dtype=str, usecols=['id'])
+                all_ids.update(df['id'].apply(_norm_id))
+            except Exception as e:
+                logging.warning(f"Error leyendo {direct_csv}: {e}")
+        else:
+            print(f"⚠ No existe alerta directa: {direct_csv}. Se generará con 'no_info'.")
+        
+        # Buscar alertas indirectas
+        indirect_csv = indirect_alerts_dir / f"{source}_indirect_alert_{period_type}_{period}.csv"
+        if indirect_csv.exists():
+            try:
+                df = pd.read_csv(indirect_csv, dtype=str, usecols=['id'])
+                all_ids.update(df['id'].apply(_norm_id))
+            except Exception as e:
+                logging.warning(f"Error leyendo {indirect_csv}: {e}")
+        else:
+            print(f"⚠ No existe alerta indirecta: {indirect_csv}. Se generará con 'no_info'.")
+    
+    all_ids.discard("")
+    print(f"✅ IDs encontrados: {len(all_ids)}")
+    
+    # Obtener mapeo de MongoDB (usar precargado si disponible)
+    if mongo_map_df is not None and not mongo_map_df.empty:
+        # Usar mapeo precargado desde DataManager (evita consulta adicional a MongoDB)
+        print(f"📦 Usando mapeo MongoDB precargado desde DataManager ({len(mongo_map_df)} farms)")
+        # Filtrar solo los IDs que necesitamos
+        mongo_map_df = mongo_map_df[mongo_map_df['id'].isin(all_ids)].copy()
+        print(f"   • IDs filtrados: {len(mongo_map_df)}")
+    else:
+        # Fallback: construir mapeo consultando MongoDB directamente
+        print("📊 Construyendo mapeo MongoDB (consulta directa)...")
+        mongo_map_df = build_mongo_maps(all_ids) if all_ids else pd.DataFrame(columns=['id', 'farm_id', 'farm_poligons_id'])
+    
+    # Procesar cada período
+    files_generated = []
+
+    print("folder direct alerts:", direct_alerts_dir)
+    print("folder indirect alerts:", indirect_alerts_dir)
+    
+    
+    for period in tqdm(periods, desc="Consolidando riesgo total"):
+        # Cargar alertas directas
+        direct_csv = direct_alerts_dir / f"{source}_direct_alert_{period_type}_{period}.csv"
+        
+        if not direct_csv.exists():
+            logging.warning(f"No existe alerta directa: {direct_csv}")
+            continue
+        
+        df_direct = pd.read_csv(direct_csv, dtype=str, low_memory=False)
+        if 'id' not in df_direct.columns:
+            logging.warning(f"CSV sin columna 'id': {direct_csv}")
+            continue
+        
+        df_direct['id'] = df_direct['id'].apply(_norm_id)
+        
+        # Asegurar columna direct_alert
+        if 'direct_alert' not in df_direct.columns:
+            if 'intersect_deforestation' in df_direct.columns:
+                df_direct['direct_alert'] = df_direct['intersect_deforestation']
+            else:
+                df_direct['direct_alert'] = 'False'
+        
+        # Cargar alertas indirectas (opcional)
+        indirect_csv = indirect_alerts_dir / f"{source}_indirect_alert_{period_type}_{period}.csv"
+        
+        mov_cols = ['n_total_mov', 'n_in', 'n_out', 'n_indirect_in', 'n_indirect_out', 
+                   'indirect_alert_in', 'indirect_alert_out']
+        
+        if indirect_csv.exists():
+            df_indirect = pd.read_csv(indirect_csv, dtype=str, low_memory=False)
+            if 'id' in df_indirect.columns:
+                df_indirect['id'] = df_indirect['id'].apply(_norm_id)
+            else:
+                df_indirect = pd.DataFrame({'id': df_direct['id'], **{c: 'no_info' for c in mov_cols}})
+        else:
+            print(f"⚠ No existe alerta indirecta: {indirect_csv}. Se generará con 'no_info'.")
+            df_indirect = pd.DataFrame({'id': df_direct['id'], **{c: 'no_info' for c in mov_cols}})
+        
+        # Asegurar columnas de movimiento
+        for c in mov_cols:
+            if c not in df_indirect.columns:
+                df_indirect[c] = 'no_info'
+        
+        # Merge: direct + indirect
+        merged = pd.merge(
+            df_direct[['id', 'direct_alert', 'deforested_ha', 'deforested_prop'] + 
+                     [c for c in df_direct.columns if c not in ['id', 'direct_alert', 'deforested_ha', 'deforested_prop']]],
+            df_indirect[['id'] + mov_cols],
+            on='id', how='outer'
+        )
+        
+        # Merge con métricas espaciales
+        if not metrics_df.empty:
+            merged = pd.merge(merged, metrics_df, on='id', how='left')
+        
+        # Merge con mapeo MongoDB
+        if not mongo_map_df.empty:
+            merged = pd.merge(merged, mongo_map_df, on='id', how='left')
+        else:
+            merged['farm_id'] = ''
+            merged['farm_poligons_id'] = ''
+        
+        # Guardar resultado
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_csv = output_dir / f"{source}_total_risk_{period_type}_{period}.csv"
+        
+        merged.to_csv(output_csv, index=False, encoding='utf-8')
+        files_generated.append(str(output_csv))
+        print(f"✅ Generado: {output_csv.name}")
+    
+    execution_time = time.perf_counter() - T0
+    
+    return {
+        'success': len(files_generated) > 0,
+        'periods_processed': len(files_generated),
+        'files_generated': files_generated,
+        'execution_time': execution_time
+    }

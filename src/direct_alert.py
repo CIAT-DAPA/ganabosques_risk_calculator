@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import os, re, gc, time, logging, sys
-from typing import Dict, Any, Tuple, List, Optional, Set
+from typing import Dict, Any, Tuple, List, Optional
 import math
 import numpy as np
 import pandas as pd
@@ -14,6 +14,10 @@ from shapely.geometry import mapping
 from shapely.ops import unary_union, transform as shapely_transform
 from shapely.validation import make_valid
 from pyproj import Transformer
+from tqdm import tqdm
+from rasterio.features import shapes
+from shapely.geometry import shape
+from shapely.ops import unary_union
 
 # ===================== AJUSTES =====================
 SETTINGS: Dict[str, Any] = {
@@ -317,7 +321,14 @@ def calculate_deforestation_metrics_from_src(src, geom, deforest_value, use_prec
             func = lambda x, y, z=None: transformer.transform(x, y)
             geom_for_mask = shapely_transform(func, geom)
 
-        out_image, out_transform = mask(src, [mapping(geom_for_mask)], crop=True, filled=False)
+        # all_touched=True cuando precise-area: incluir TODOS los píxeles que tocan
+        # el polígono (no solo los cuyo centro cae dentro). El super-sampling
+        # se encargará de calcular la fracción real de cobertura de cada píxel.
+        out_image, out_transform = mask(
+            src, [mapping(geom_for_mask)],
+            crop=True, filled=False,
+            all_touched=use_precise_area
+        )
         arr = out_image[0]  # MaskedArray
         valid = ~np.ma.getmaskarray(arr)
         m = valid & (arr.data == deforest_value)
@@ -336,37 +347,72 @@ def calculate_deforestation_metrics_from_src(src, geom, deforest_value, use_prec
         if use_precise_area:
             # 🎯 MÉTODO PRECISO: Super-sampling con fracciones de píxel
             # Crear grilla de alta resolución para calcular cobertura fraccionaria
-            height, width = arr.shape
-            supersample_shape = (height * supersample_factor, width * supersample_factor)
-            
-            # Ajustar transform para la grilla fina
-            from rasterio.transform import Affine
-            super_transform = Affine(
-                out_transform.a / supersample_factor,
-                out_transform.b,
-                out_transform.c,
-                out_transform.d,
-                out_transform.e / supersample_factor,
-                out_transform.f
-            )
-            
-            # Rasterizar geometría en grilla fina
-            super_coverage = rasterize(
-                [(geom_for_mask, 1)],
-                out_shape=supersample_shape,
-                transform=super_transform,
-                all_touched=False,
-                dtype='uint8',
-                fill=0
-            )
-            
-            # Reducir a resolución original contando sub-píxeles
-            reshaped = super_coverage.reshape(height, supersample_factor, width, supersample_factor)
-            coverage_fraction = reshaped.sum(axis=(1, 3)) / (supersample_factor * supersample_factor)
-            
-            # Calcular área usando fracciones
-            fractional_count = float(np.sum(coverage_fraction[m]))
-            defo_ha = fractional_count * pixel_area / 10_000.0
+            out_image, out_transform = mask(src, [mapping(geom)], crop=True, filled=False,
+            all_touched=use_precise_area)
+            arr = out_image[0]
+
+            # Crear máscara de clase deforestación
+            mask_def = arr == deforest_value
+            if not mask_def.any():
+                return False, 0.0, 0.0
+
+            # Vectorizar SOLO píxeles deforestados
+            pixel_polygons = []
+            for geom_json, value in shapes(arr, mask=mask_def, transform=out_transform):
+                if value == deforest_value:
+                    pixel_polygons.append(shape(geom_json))
+
+            if not pixel_polygons:
+                return False, 0.0, 0.0
+
+            # Unir todos los píxeles en una sola geometría
+            union_pixels = unary_union(pixel_polygons)
+
+            # Intersección geométrica real
+            intersection = geom.intersection(union_pixels)
+
+            if intersection.is_empty:
+                return False, 0.0, 0.0
+
+            # Área exacta en hectáreas
+            area_m2 = intersection.area
+            defo_ha = area_m2 / 10000.0
+
+            """ elif use_precise_area:
+                # 🎯 MÉTODO PRECISO: Super-sampling con fracciones de píxel
+                # Crear grilla de alta resolución para calcular cobertura fraccionaria
+                height, width = arr.shape
+                supersample_shape = (height * supersample_factor, width * supersample_factor)
+                
+                # Ajustar transform para la grilla fina
+                from rasterio.transform import Affine
+                super_transform = Affine(
+                    out_transform.a / supersample_factor,
+                    out_transform.b,
+                    out_transform.c,
+                    out_transform.d,
+                    out_transform.e / supersample_factor,
+                    out_transform.f
+                )
+                
+                # Rasterizar geometría en grilla fina
+                super_coverage = rasterize(
+                    [(geom_for_mask, 1)],
+                    out_shape=supersample_shape,
+                    transform=super_transform,
+                    all_touched=True,
+                    dtype='uint8',
+                    fill=0
+                )
+                
+                # Reducir a resolución original contando sub-píxeles
+                reshaped = super_coverage.reshape(height, supersample_factor, width, supersample_factor)
+                coverage_fraction = reshaped.sum(axis=(1, 3)) / (supersample_factor * supersample_factor)
+                
+                # Calcular área usando fracciones
+                fractional_count = float(np.sum(coverage_fraction[m]))
+                defo_ha = fractional_count * pixel_area / 10_000.0 """
+        
         else:
             # ⚡ MÉTODO RÁPIDO: Contar píxeles completos (método actual)
             defo_ha = cnt * pixel_area / 10_000.0
@@ -416,9 +462,9 @@ def area_from_rasters_open(geom, src_list) -> float:
     return float(total_ha)
 
 # ===================== Procesamiento por fila (usando rasters abiertos) =====================
-def process_row_option1(row, raster_src, deforest_value: int, use_precise_area: bool = False):
+def process_row_option1(row, raster_src, deforest_value: int, use_precise_area: bool = False, pixel_divisions: int = 5):
     farm_id = row["farm_id"]; geom = row["geometry"]
-    inter_def, def_ha, def_prop = calculate_deforestation_metrics_from_src(raster_src, geom, deforest_value, use_precise_area=use_precise_area)
+    inter_def, def_ha, def_prop = calculate_deforestation_metrics_from_src(raster_src, geom, deforest_value, use_precise_area=use_precise_area, supersample_factor=pixel_divisions)
     def _r4(x): return round(float(x), 4)
     def _r6(x): return round(float(x), 6)
     return {
@@ -499,15 +545,45 @@ def print_availability_option(name: str, found: bool, details: str = ""):
     yn = "Sí" if found else "No"
     print(f"  • {name}: {yn} {details}")
 
-def make_out_dir_and_paths(base_output_template: str, ctx: Dict[str,str], source_tag: str) -> Tuple[str,str]:
+def make_out_dir_and_paths(base_output_template: str, ctx: Dict[str,str], source_tag: str, deforestation_type: str = None) -> Tuple[str,str]:
+    """
+    Genera directorio de salida y ruta del CSV para alertas directas.
+    
+    Nueva estructura de carpetas:
+    results/{source}/{deforestation_type}/direct_alerts/{period}/
+    
+    Args:
+        base_output_template: Template base para la ruta de salida
+        ctx: Diccionario con contexto (PERIODO, YEARS)
+        source_tag: Fuente de deforestación (siempre 'smbyc')
+        deforestation_type: Tipo de deforestación ('annual', 'cumulative', 'nad', 'atd')
+    
+    Returns:
+        Tuple con (directorio_salida, ruta_csv)
+    """
     formatted = norm(format_placeholders(base_output_template, ctx))
     base_dir = os.path.dirname(formatted) or "."
-    option_map = {"smbyc": "SMBYC", "atd": "ATD", "nad": "NAD", "otra": "OTRA"}
-    option_folder = option_map.get(str(source_tag).lower(), str(source_tag).upper())
+    
+    # Subir un nivel desde el directorio base para construir la nueva estructura
+    # base_dir típicamente es: .../results/direct_alerts
+    # Queremos: .../results/{source}/{deforestation_type}/direct_alerts/{period}
+    results_parent = os.path.dirname(base_dir)  # .../results
+    
     years = ctx["YEARS"]
-    out_dir = norm(os.path.join(base_dir, option_folder, years))
+    periodo = ctx["PERIODO"]
+    
+    # Si se proporciona deforestation_type, usar nueva estructura
+    if deforestation_type:
+        # Estructura: results/{source}/{deforestation_type}/direct_alerts/
+        out_dir = norm(os.path.join(results_parent, source_tag.lower(), deforestation_type.lower(), "direct_alerts"))
+    else:
+        # Fallback a estructura anterior para compatibilidad
+        option_map = {"smbyc": "SMBYC", "atd": "ATD", "nad": "NAD", "otra": "OTRA"}
+        option_folder = option_map.get(str(source_tag).lower(), str(source_tag).upper())
+        out_dir = norm(os.path.join(base_dir, option_folder, years))
+    
     os.makedirs(out_dir, exist_ok=True)
-    out_csv = norm(os.path.join(out_dir, f"{source_tag}_direct_alert_{ctx['PERIODO']}_{years}.csv"))
+    out_csv = norm(os.path.join(out_dir, f"{source_tag}_direct_alert_{deforestation_type or periodo}_{years}.csv"))
     return out_dir, out_csv
 
 def write_reason_log(out_dir: str, fname: str, msg: str):
@@ -524,8 +600,6 @@ def calculate_direct_alerts(
     farm_folder: str,
     raster_template: str,
     output_csv: str,
-    alerts_dir: Optional[str] = None,
-    nucleos_dir: Optional[str] = None,
     batch_size: int = 1000,
     farm_range: str = "",
     crs: str = "EPSG:3116",
@@ -534,6 +608,7 @@ def calculate_direct_alerts(
     log_file: str = "risk_analysis_intersections.log",
     raster_paths_dict: Optional[Dict[str, str]] = None,
     use_precise_area: bool = False,
+    pixel_divisions: int = 5,
     _data_manager: Optional[Any] = None,
     _farms_metadata: Optional[List[Dict]] = None,
     _farm_limit: Optional[int] = None
@@ -542,14 +617,12 @@ def calculate_direct_alerts(
     Calcula alertas directas de deforestación para predios ganaderos.
     
     Args:
-        source: Fuente de deforestación ('smbyc', 'nad', 'atd')
-        period_type: Tipo de período ('annual', 'cumulative', 'quarterly')
+        source: Fuente de deforestación ('smbyc')
+        period_type: Tipo de período ('annual', 'cumulative', 'nad', 'atd')
         years: Lista de períodos a procesar (ej: ['2013-2014', '2014-2015'])
         farm_folder: Ruta a carpeta con GeoJSON de predios
         raster_template: Template del raster de deforestación con placeholders {PERIODO} y {YEARS}
         output_csv: Template del CSV de salida con placeholders
-        alerts_dir: Template de carpeta de alertas tempranas (opcional)
-        nucleos_dir: Template de carpeta de núcleos activos (opcional)
         batch_size: Tamaño de lote para procesamiento
         farm_range: Rango de archivos a procesar (ej: "1:1000")
         crs: Sistema de coordenadas (default: EPSG:3116)
@@ -557,7 +630,8 @@ def calculate_direct_alerts(
         log_level: Nivel de logging
         log_file: Archivo de log
         raster_paths_dict: Diccionario {period_name: raster_path} con rutas preparadas (opcional)
-        use_precise_area: Si True, usa super-sampling 5×5 para cálculo preciso de fracciones de píxel (~250x más lento pero reduce error del 100% a ~10-20%)
+        use_precise_area: Si True, usa super-sampling para cálculo preciso de fracciones de píxel
+        pixel_divisions: Divisiones por píxel para super-sampling (default 5 = 5×5 = 25 sub-píxeles)
         
     Returns:
         Dict con estadísticas: {
@@ -578,33 +652,22 @@ def calculate_direct_alerts(
     console.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
     root.addHandler(console)
 
-    # Determinar opciones a procesar
-    chosen: Set[int] = {1}  # Opción 1 (deforestación) siempre activa
-    if alerts_dir:
-        chosen.add(2)  # Opción 2 (alertas tempranas ATD)
-    if nucleos_dir:
-        chosen.add(3)  # Opción 3 (núcleos activos NAD)
-    
     # Mapear source a tag y deforest_value
     if source.lower() == "smbyc":
         defo_val = deforest_value
         opt1_tag = "smbyc"
-    elif source.lower() in ["nad", "atd"]:
-        defo_val = deforest_value
-        opt1_tag = source.lower()
     else:
+        # Fallback para fuentes no reconocidas
         defo_val = deforest_value
-        opt1_tag = "otra"
+        opt1_tag = source.lower() if source else "smbyc"
     
-    print(f"🟩 Opción 1 activa. Fuente: {source} | deforest_value={defo_val}")
+    print(f"🟩 Procesando alertas directas. Fuente: {source} | Tipo: {period_type} | deforest_value={defo_val}")
     if use_precise_area:
-        print("🎯 Modo PRECISO habilitado: Usando super-sampling 5×5 para fracciones de píxel (~250x más lento pero error <20%)")
+        print(f"🎯 Modo PRECISO habilitado: Usando super-sampling {pixel_divisions}×{pixel_divisions} para fracciones de píxel")
     else:
         print("⚡ Modo RÁPIDO: Conteo de píxeles completos (puede tener error ~100% en bordes)")
     
     folder_geojsons = norm(farm_folder)
-    alerts_dir_tpl = alerts_dir or ""
-    nucleos_dir_tpl = nucleos_dir or ""
     output_tpl = output_csv
     periodo = period_type
     years_list = years
@@ -716,102 +779,51 @@ def calculate_direct_alerts(
 
     start_all = time.time()
     # ===================== LOOP POR YEARS =====================
-    for p_idx, years in enumerate(years_list, start=1):
-        print(f"\n=== [{p_idx}/{len(years_list)}] Periodo: {years} — etiqueta periodo: {periodo} ===")
+    periods_progress = tqdm(
+        enumerate(years_list, start=1),
+        total=len(years_list),
+        desc="📅 Períodos",
+        unit="período",
+        position=0,
+        leave=True
+    )
+    for p_idx, years in periods_progress:
+        periods_progress.set_description(f"📅 Procesando {years}")
         ctx = {"PERIODO": periodo, "YEARS": years}
 
-        # --- Opción 1: deforestación (abrir UNA VEZ por YEARS)
-        if 1 in chosen:
-            # Usar ruta preparada si está disponible, sino usar template
-            if raster_paths_dict and years in raster_paths_dict:
-                raster_deforest = raster_paths_dict[years]
-                print(f"🔎 Usando raster preparado: {os.path.basename(raster_deforest)}")
-            else:
-                raster_deforest = norm(format_placeholders(raster_template, ctx))
-                print(f"🔎 Validando raster deforestación: {raster_deforest}")
-            
-            try:
-                ensure_raster_crs(raster_deforest, crs)
-                raster_src_o1 = open_raster(raster_deforest, target_crs=crs)
-                opt1_available = True
-                print_availability_option("Deforestación (raster)", True, f"→ {os.path.basename(raster_deforest)}")
-            except Exception as e:
-                logging.error(f"[{years}] Opción 1: {e}")
-                print("❌ No se encontró/validó el raster de deforestación; se omite opción 1 en este periodo.")
-                raster_src_o1 = None
-                opt1_available = False
+        # --- Cargar raster de deforestación para este período
+        # Usar ruta preparada si está disponible, sino usar template
+        if raster_paths_dict and years in raster_paths_dict:
+            raster_deforest = raster_paths_dict[years]
+            print(f"🔎 Usando raster preparado: {os.path.basename(raster_deforest)}")
         else:
+            raster_deforest = norm(format_placeholders(raster_template, ctx))
+            print(f"🔎 Validando raster deforestación: {raster_deforest}")
+        
+        try:
+            ensure_raster_crs(raster_deforest, crs)
+            raster_src_o1 = open_raster(raster_deforest, target_crs=crs)
+            opt1_available = True
+            print_availability_option("Deforestación (raster)", True, f"→ {os.path.basename(raster_deforest)}")
+        except Exception as e:
+            logging.error(f"[{years}] Error cargando raster: {e}")
+            print("❌ No se encontró/validó el raster de deforestación; se omite este periodo.")
             raster_src_o1 = None
             opt1_available = False
 
-        # --- Opción 2: alertas tempranas (abrir UNA VEZ por YEARS)
-        if 2 in chosen:
-            print(f"📂 Cargando bundle de alertas tempranas...")
-            alerts_vec, alerts_ras, alerts_sum = load_bundle(alerts_dir_tpl, ctx, crs)
-            alerts_ras_ok = _filter_rasters_same_crs(alerts_ras, crs) if alerts_ras else []
-            alerts_src_list = open_rasters(alerts_ras_ok, target_crs=crs) if alerts_ras_ok else []
-            has2 = (alerts_vec is not None and not alerts_vec.empty) or (len(alerts_src_list) > 0)
-            print_availability_option(
-                "Alertas tempranas (carpeta)", has2,
-                f"| vectores={alerts_sum.get('vec_files',0)} rasters={alerts_sum.get('ras_files',0)} (usables={len(alerts_src_list)})"
-            )
-            if not has2:
-                opt2_dir, _ = make_out_dir_and_paths(output_tpl, ctx, "atd")
-                write_reason_log(opt2_dir, f"atd_log_{periodo}_{years}.txt",
-                                 f"[{years}] Sin datos de alertas tempranas (no se generó atd_direct_alert_{periodo}_{years}.csv)")
-            opt2_available = has2
-        else:
-            alerts_vec = None
-            alerts_src_list = []
-            opt2_available = False
-
-        # --- Opción 3: núcleos activos (abrir UNA VEZ por YEARS)
-        if 3 in chosen:
-            print(f"📂 Cargando bundle de núcleos activos...")
-            nucleos_vec, nucleos_ras, nucleos_sum = load_bundle(nucleos_dir_tpl, ctx, crs)
-            nucleos_ras_ok = _filter_rasters_same_crs(nucleos_ras, crs) if nucleos_ras else []
-            nucleos_src_list = open_rasters(nucleos_ras_ok, target_crs=crs) if nucleos_ras_ok else []
-            has3 = (nucleos_vec is not None and not nucleos_vec.empty) or (len(nucleos_src_list) > 0)
-            print_availability_option(
-                "Núcleos activos (carpeta)", has3,
-                f"| vectores={nucleos_sum.get('vec_files',0)} rasters={nucleos_sum.get('ras_files',0)} (usables={len(nucleos_src_list)})"
-            )
-            if not has3:
-                opt3_dir, _ = make_out_dir_and_paths(output_tpl, ctx, "nad")
-                write_reason_log(opt3_dir, f"nad_log_{periodo}_{years}.txt",
-                                 f"[{years}] Sin datos de núcleos activos (no se generó nad_direct_alert_{periodo}_{years}.csv)")
-            opt3_available = has3
-        else:
-            nucleos_vec = None
-            nucleos_src_list = []
-            opt3_available = False
-
-        if not any([opt1_available, opt2_available, opt3_available]):
-            print("⚠ Ninguna opción disponible para este periodo. Se omite generación de resultados.")
-            # Limpieza mínima por si quedaron objetos
+        # Verificar si hay datos disponibles
+        if not opt1_available:
+            print("⚠ No hay raster disponible para este periodo. Se omite generación de resultados.")
             close_rasters([raster_src_o1] if raster_src_o1 else [])
-            close_rasters(alerts_src_list)
-            close_rasters(nucleos_src_list)
-            del alerts_vec, alerts_src_list, nucleos_vec, nucleos_src_list
             gc.collect()
             continue
 
-        # Salidas por opción (se limpian si existen)
-        if opt1_available:
-            _, out_csv_o1 = make_out_dir_and_paths(output_tpl, ctx, opt1_tag)
-            if os.path.exists(out_csv_o1):
-                os.remove(out_csv_o1)
-            print(f"🗂️ Salida O1: {out_csv_o1}")
-        if opt2_available:
-            _, out_csv_o2 = make_out_dir_and_paths(output_tpl, ctx, "atd")
-            if os.path.exists(out_csv_o2):
-                os.remove(out_csv_o2)
-            print(f"🗂️ Salida O2: {out_csv_o2}")
-        if opt3_available:
-            _, out_csv_o3 = make_out_dir_and_paths(output_tpl, ctx, "nad")
-            if os.path.exists(out_csv_o3):
-                os.remove(out_csv_o3)
-            print(f"🗂️ Salida O3: {out_csv_o3}")
+        # Salida CSV con nueva estructura de carpetas
+        # results/{source}/{deforestation_type}/direct_alerts/{period}/
+        _, out_csv_o1 = make_out_dir_and_paths(output_tpl, ctx, opt1_tag, deforestation_type=periodo)
+        if os.path.exists(out_csv_o1):
+            os.remove(out_csv_o1)
+        print(f"🗂️ Salida: {out_csv_o1}")
 
         # ===================== LOOP POR LOTES =====================
         start_period = time.time()
@@ -826,9 +838,10 @@ def calculate_direct_alerts(
             if _data_manager and hasattr(_data_manager, '_geometries_cache') and _data_manager._geometries_cache:
                 for file in batch:
                     try:
-                        # Extraer farm_id del nombre del archivo
-                        m = re.search(r"(?:[_-])(\d+)\.geojson$", file, re.IGNORECASE) or re.search(r"(\d+)\.geojson$", file, re.IGNORECASE)
-                        farm_id = m.group(1) if m else os.path.splitext(file)[0]
+                        # El archivo se nombró con sitcode (SIT_CODE o GEOFARMER_ID),
+                        # que es la misma clave usada en _geometries_cache.
+                        # Usar el stem del archivo directamente como farm_id.
+                        farm_id = os.path.splitext(file)[0]
                         
                         # Obtener geometría desde caché
                         geom = _data_manager.get_geometry(farm_id)
@@ -866,75 +879,41 @@ def calculate_direct_alerts(
 
             merged = gpd.GeoDataFrame(pd.concat(gdf_list, ignore_index=True), crs=crs)
 
-            # Acumuladores por opción
-            results1 = [] if opt1_available else None
-            results2 = [] if opt2_available else None
-            results3 = [] if opt3_available else None
+            # Acumulador de resultados
+            results = []
 
             total_rows = len(merged)
-            for ridx, r in enumerate(merged.itertuples(index=False), start=1):
+            # Usar tqdm para barra de progreso dentro de cada período
+            farm_progress = tqdm(
+                enumerate(merged.itertuples(index=False), start=1),
+                total=total_rows,
+                desc=f"    [{years}] Fincas",
+                unit="finca",
+                leave=False,
+                ncols=100
+            )
+            for ridx, r in farm_progress:
                 row = {"farm_id": r.farm_id, "geometry": r.geometry}
 
-                if opt1_available:
-                    try:
-                        o1 = process_row_option1(row, raster_src_o1, defo_val, use_precise_area=use_precise_area)
-                        results1.append(o1)
-                    except Exception as e:
-                        logging.warning(f"[{years}] Opción 1 error finca {row.get('farm_id')}: {e}")
+                try:
+                    o1 = process_row_option1(row, raster_src_o1, defo_val, use_precise_area=use_precise_area, pixel_divisions=pixel_divisions)
+                    results.append(o1)
+                except Exception as e:
+                    logging.warning(f"[{years}] Error finca {row.get('farm_id')}: {e}")
 
-                if opt2_available:
-                    try:
-                        o2, _ = process_row_option2(row, alerts_vec, alerts_src_list, crs)
-                        results2.append(o2)
-                    except Exception as e:
-                        logging.warning(f"[{years}] Opción 2 error finca {row.get('farm_id')}: {e}")
-
-                if opt3_available:
-                    try:
-                        o3, _ = process_row_option3(row, nucleos_vec, nucleos_src_list, crs)
-                        results3.append(o3)
-                    except Exception as e:
-                        logging.warning(f"[{years}] Opción 3 error finca {row.get('farm_id')}: {e}")
-
-                if (ridx % 500 == 0) or (ridx == total_rows):
-                    print(f"    - Fincas procesadas: {ridx}/{total_rows}")
-
-            # Escritura por opción (append)
-            if opt1_available and results1:
-                df1 = pd.DataFrame(results1)[["id","intersect_deforestation","deforested_ha","deforested_prop","direct_alert"]]
+            # Escritura de resultados
+            if results:
+                df1 = pd.DataFrame(results)[["id","intersect_deforestation","deforested_ha","deforested_prop","direct_alert"]]
                 header_needed = not os.path.exists(out_csv_o1)
                 df1.to_csv(out_csv_o1, mode='a', index=False, header=header_needed)
 
-            if opt2_available and results2:
-                df2 = pd.DataFrame(results2)[["id","intersect_early_warnings","early_warnings_ha","early_warnings_prop","direct_alert"]]
-                header_needed = not os.path.exists(out_csv_o2)
-                df2.to_csv(out_csv_o2, mode='a', index=False, header=header_needed)
-
-            if opt3_available and results3:
-                df3 = pd.DataFrame(results3)[["id","intersect_active_hotspots","active_hotspots_ha","active_hotspots_prop","direct_alert"]]
-                header_needed = not os.path.exists(out_csv_o3)
-                df3.to_csv(out_csv_o3, mode='a', index=False, header=header_needed)
-
             # Limpieza por lote
-            del gdf_list, merged, results1, results2, results3
+            del gdf_list, merged, results
             gc.collect()
             print(f"  ⏱️ Tiempo lote {b_idx}: {time.time()-t_batch:.2f}s")
 
-        # Mensajes finales por opción
-        if opt1_available:
-            print(f"✅ Opción 1 ({opt1_tag}) completada → {out_csv_o1}")
-        if opt2_available:
-            if os.path.exists(out_csv_o2):
-                print(f"✅ Opción 2 (ATD) completada → {out_csv_o2}")
-            else:
-                opt2_dir, _ = make_out_dir_and_paths(output_tpl, ctx, "atd")
-                print(f"⚠ Opción 2: no se generó CSV. Revisa el log en {opt2_dir}")
-        if opt3_available:
-            if os.path.exists(out_csv_o3):
-                print(f"✅ Opción 3 (NAD) completada → {out_csv_o3}")
-            else:
-                opt3_dir, _ = make_out_dir_and_paths(output_tpl, ctx, "nad")
-                print(f"⚠ Opción 3: no se generó CSV. Revisa el log en {opt3_dir}")
+        # Mensaje final
+        print(f"✅ {opt1_tag.upper()} completado → {out_csv_o1}")
 
         print(f"⏱ Tiempo periodo {years}: {time.time()-start_period:.2f} s")
 
@@ -942,12 +921,8 @@ def calculate_direct_alerts(
         try:
             if raster_src_o1:
                 raster_src_o1.close()
-            close_rasters(alerts_src_list)
-            close_rasters(nucleos_src_list)
         except Exception:
             pass
-
-        del alerts_vec, alerts_src_list, nucleos_vec, nucleos_src_list
         gc.collect()
 
     print(f"\n🎉 Periodos completados: {', '.join(years_list)}")
@@ -979,9 +954,9 @@ if __name__ == "__main__":
     
     # Argumentos CLI
     parser.add_argument("--source", "-s", default=env_source or "smbyc",
-                       help="Fuente de deforestación: smbyc, nad, atd")
+                       help="Fuente de deforestación: smbyc")
     parser.add_argument("--period-type", "-pt", default=env_period or "annual",
-                       help="Tipo de período: annual, cumulative, quarterly")
+                       help="Tipo de período: annual, cumulative, nad, atd")
     parser.add_argument("--years", "-y", default=env_years,
                        help="Períodos separados por coma: 2013-2014,2014-2015 o 202301,202302")
     
@@ -991,11 +966,6 @@ if __name__ == "__main__":
                        help="Template del raster con {PERIODO} y {YEARS}")
     parser.add_argument("--output-csv", "-o", default=SETTINGS.get("OUTPUT_CSV", ""),
                        help="Template del CSV de salida")
-    
-    parser.add_argument("--alerts-dir", default=SETTINGS.get("ALERTAS_DIR"),
-                       help="Template de carpeta de alertas tempranas")
-    parser.add_argument("--nucleos-dir", default=SETTINGS.get("NUCLEOS_DIR"),
-                       help="Template de carpeta de núcleos activos")
     
     parser.add_argument("--batch-size", type=int, default=SETTINGS.get("BATCH_SIZE", 1000),
                        help="Tamaño de lote para procesamiento")
@@ -1028,8 +998,6 @@ if __name__ == "__main__":
             farm_folder=args.farm_folder,
             raster_template=args.raster_template,
             output_csv=args.output_csv,
-            alerts_dir=args.alerts_dir,
-            nucleos_dir=args.nucleos_dir,
             batch_size=args.batch_size,
             farm_range=args.farm_range,
             crs=args.crs,
