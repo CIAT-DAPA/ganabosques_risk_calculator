@@ -14,6 +14,7 @@ from shapely.geometry.base import BaseGeometry
 from tqdm import tqdm
 
 from config import config
+from ganabosques_risk_package.total_risk import total_risk as pkg_total_risk
 
 # --- ORM (preferido) o fallback sin conexión
 try:
@@ -835,17 +836,14 @@ def calculate_total_risk(
             if c not in df_indirect.columns:
                 df_indirect[c] = 'no_info'
         
-        # Merge: direct + indirect
-        merged = pd.merge(
-            df_direct[['id', 'direct_alert', 'deforested_ha', 'deforested_prop'] + 
-                     [c for c in df_direct.columns if c not in ['id', 'direct_alert', 'deforested_ha', 'deforested_prop']]],
-            df_indirect[['id'] + mov_cols],
-            on='id', how='outer'
+        # Usar paquete ganabosques_risk_package para consolidar riesgo total
+        merged = pkg_total_risk(
+            direct_df=df_direct,
+            indirect_df=df_indirect,
+            metrics_df=metrics_df if not metrics_df.empty else None,
+            id_column='id',
+            show_progress=True,
         )
-        
-        # Merge con métricas espaciales
-        if not metrics_df.empty:
-            merged = pd.merge(merged, metrics_df, on='id', how='left')
         
         # Merge con mapeo MongoDB
         if not mongo_map_df.empty:

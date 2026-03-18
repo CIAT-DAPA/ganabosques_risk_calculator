@@ -399,6 +399,7 @@ def save_adm3_risk_to_db(
                 existing.def_ha = row.get('def_ha', 0.0)
                 existing.farm_amount = row.get('farm_amount', 0)
                 existing.risk_total = row.get('risk_total', False)
+                existing.farm_total_amount = row.get('farm_amount_total', 0)
                 existing.save()
             else:
                 # Crear nuevo
@@ -407,7 +408,8 @@ def save_adm3_risk_to_db(
                     analysis_id=analysis_oid,
                     def_ha=row.get('def_ha', 0.0),
                     farm_amount=row.get('farm_amount', 0),
-                    risk_total=row.get('risk_total', False)
+                    risk_total=row.get('risk_total', False),
+                    farm_total_amount=row.get('farm_amount_total', 0)
                 )
                 adm3_risk.save()
             
@@ -473,7 +475,8 @@ def save_adm3_risk_to_db_bulk(
                 analysis_id=analysis_oid,
                 def_ha=row.get('def_ha', 0.0),
                 farm_amount=row.get('farm_amount', 0),
-                risk_total=row.get('risk_total', False)
+                risk_total=row.get('risk_total', False),
+                farm_total_amount=row.get('farm_amount_total', 0)
             )
             docs_to_insert.append(doc)
             

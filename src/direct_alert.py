@@ -18,6 +18,7 @@ from tqdm import tqdm
 from rasterio.features import shapes
 from shapely.geometry import shape
 from shapely.ops import unary_union
+from ganabosques_risk_package.alert_direct import alert_direct as pkg_alert_direct
 
 # ===================== AJUSTES =====================
 SETTINGS: Dict[str, Any] = {
@@ -879,36 +880,27 @@ def calculate_direct_alerts(
 
             merged = gpd.GeoDataFrame(pd.concat(gdf_list, ignore_index=True), crs=crs)
 
-            # Acumulador de resultados
-            results = []
-
-            total_rows = len(merged)
-            # Usar tqdm para barra de progreso dentro de cada período
-            farm_progress = tqdm(
-                enumerate(merged.itertuples(index=False), start=1),
-                total=total_rows,
-                desc=f"    [{years}] Fincas",
-                unit="finca",
-                leave=False,
-                ncols=100
+            # ── Usar ganabosques_risk_package.alert_direct ──
+            merged = merged.rename(columns={"farm_id": "id"})
+            batch_result = pkg_alert_direct(
+                plots=merged,
+                deforestation_raster=raster_deforest,
+                deforestation_value=defo_val,
+                crs=crs,
+                id_column="id",
+                use_precise_area=use_precise_area,
+                show_progress=True,
             )
-            for ridx, r in farm_progress:
-                row = {"farm_id": r.farm_id, "geometry": r.geometry}
 
-                try:
-                    o1 = process_row_option1(row, raster_src_o1, defo_val, use_precise_area=use_precise_area, pixel_divisions=pixel_divisions)
-                    results.append(o1)
-                except Exception as e:
-                    logging.warning(f"[{years}] Error finca {row.get('farm_id')}: {e}")
-
-            # Escritura de resultados
-            if results:
-                df1 = pd.DataFrame(results)[["id","intersect_deforestation","deforested_ha","deforested_prop","direct_alert"]]
+            # Escritura de resultados (mantener compatibilidad con columnas originales)
+            if not batch_result.empty:
+                batch_result["intersect_deforestation"] = batch_result["direct_alert"]
+                out_cols = ["id", "intersect_deforestation", "deforested_ha", "deforested_prop", "direct_alert"]
                 header_needed = not os.path.exists(out_csv_o1)
-                df1.to_csv(out_csv_o1, mode='a', index=False, header=header_needed)
+                batch_result[out_cols].to_csv(out_csv_o1, mode='a', index=False, header=header_needed)
 
             # Limpieza por lote
-            del gdf_list, merged, results
+            del gdf_list, merged, batch_result
             gc.collect()
             print(f"  ⏱️ Tiempo lote {b_idx}: {time.time()-t_batch:.2f}s")
 

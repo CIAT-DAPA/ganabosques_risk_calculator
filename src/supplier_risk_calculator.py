@@ -23,8 +23,10 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import pandas as pd
 from bson import ObjectId
 from tqdm import tqdm
+from ganabosques_risk_package.supplier_risk import supplier_risk as pkg_supplier_risk
 
 # ===================== IMPORTACIONES ORM =====================
 try:
@@ -378,6 +380,7 @@ def calculate_and_save_supplier_risk(
     source: str = "smbyc",
     value_chain: str = "livestock",
     cache_dir: Optional[Path] = None,
+    total_risk_dir: Optional[str] = None,
     dry_run: bool = False
 ) -> Dict[str, Any]:
     """
@@ -388,8 +391,9 @@ def calculate_and_save_supplier_risk(
     2. Cargar suppliers (con caché)
     3. Para cada período:
        a. Filtrar suppliers por año
-       b. Buscar FarmRisk de las fincas relacionadas
-       c. Guardar EnterpriseRisk con risk_input
+       b. (Opcional) Usar paquete ganabosques_risk_package para identificar fincas con riesgo desde CSV
+       c. Buscar FarmRisk de las fincas relacionadas
+       d. Guardar EnterpriseRisk con risk_input
     
     Para nad/atd: si el supplier tiene año 2017, aplica a
     201701, 201702, 201703, 201704.
@@ -401,6 +405,8 @@ def calculate_and_save_supplier_risk(
         source: Fuente de deforestación
         value_chain: Cadena de valor
         cache_dir: Directorio de caché para suppliers
+        total_risk_dir: Directorio con CSVs de total_risk (opcional). Si se proporciona,
+                        usa ganabosques_risk_package para pre-identificar fincas con riesgo.
         dry_run: Si True, no guardar en BD (solo mostrar)
         
     Returns:
@@ -429,6 +435,10 @@ def calculate_and_save_supplier_risk(
             "success": False,
             "error": f"No se encontraron suppliers para {enterprise.name}"
         }
+    
+    # Construir suppliers_df para uso con el paquete ganabosques_risk_package
+    suppliers_df = pd.DataFrame(suppliers)
+    suppliers_df['enterprise_id'] = enterprise_id
     
     # 3. Procesar cada período
     total_saved = 0
@@ -480,6 +490,42 @@ def calculate_and_save_supplier_risk(
         
         total_farm_risks += len(farm_risks)
         total_filter_farm_risks += len(filter_farmrisk)
+        
+        # Usar paquete ganabosques_risk_package para análisis de riesgo por supplier
+        try:
+            # Construir total_risk_df a partir de FarmRisk de MongoDB
+            risk_rows = []
+            for fr in farm_risks:
+                farm_oid = str(fr.farm_id.id) if hasattr(fr.farm_id, 'id') else str(fr.farm_id)
+                risk_rows.append({
+                    "id": farm_oid,
+                    "direct_alert": bool(fr.risk_direct) if fr.risk_direct else False,
+                    "indirect_alert_in": bool(fr.risk_input) if fr.risk_input else False,
+                    "indirect_alert_out": bool(fr.risk_output) if fr.risk_output else False,
+                })
+            total_risk_df = pd.DataFrame(risk_rows)
+            
+            pkg_result = pkg_supplier_risk(
+                total_risk_df=total_risk_df,
+                suppliers_df=suppliers_df,
+                period=period,
+                period_type=period_type,
+                id_column="id",
+                farm_id_column="farm_id",
+                enterprise_id_column="enterprise_id",
+                normalize_ids=False,
+                show_progress=True,
+            )
+            
+            # Guardar CSV con análisis del paquete si hay directorio de salida
+            if total_risk_dir and not pkg_result.empty:
+                out_csv_dir = Path(total_risk_dir)
+                out_csv_dir.mkdir(parents=True, exist_ok=True)
+                pkg_csv = out_csv_dir / f"{source}_supplier_risk_{period_type}_{period}_{enterprise.name.replace(' ', '_')}.csv"
+                pkg_result.to_csv(pkg_csv, index=False, encoding="utf-8-sig")
+                logging.info(f"Período {period}: análisis paquete guardado en {pkg_csv.name}")
+        except Exception as e:
+            logging.warning(f"Error usando paquete supplier_risk para {period}: {e}")
         
         # Guardar EnterpriseRisk
         if not filter_farmrisk:

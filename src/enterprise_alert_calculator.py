@@ -25,6 +25,7 @@ import pandas as pd
 from pymongo import MongoClient
 from bson import ObjectId
 from tqdm import tqdm
+from ganabosques_risk_package.alert_enterprise import alert_enterprise as pkg_alert_enterprise
 
 
 # ===================== CONFIGURACIÓN =====================
@@ -309,47 +310,20 @@ def calculate_enterprise_alerts_for_period(
         # 4. Cargar mapeo de empresas (opcional, para enriquecer)
         enterprise_map = load_enterprise_mapping(mongo_uri, mongo_db, enterprise_types)
         
-        # 5. Identificar movimientos FINCA -> EMPRESA (finca con alerta envía a empresa)
-        # El tipo_destino indica que es una empresa, no otra finca
-        enterprise_types_dest = ["SLAUGHTERHOUSE", "CATTLE_FAIR", "PROCESSOR", "ENTERPRISE"]
+        # 5-11. Usar paquete ganabosques_risk_package para cálculo de alertas de empresa
+        # Construir total_risk_df mínimo a partir de fincas con alerta
+        total_risk_df = pd.DataFrame({
+            "id": list(farms_with_alert),
+            "direct_alert": True
+        })
         
-        # Filtrar movimientos donde origen es finca con alerta y destino es empresa
-        mask_to_enterprise = (
-            movements_df["origen_id"].isin(farms_with_alert) &
-            movements_df["tipo_destino"].isin(enterprise_types_dest) if "tipo_destino" in movements_df.columns 
-            else movements_df["origen_id"].isin(farms_with_alert)
+        result_df = pkg_alert_enterprise(
+            total_risk_df=total_risk_df,
+            movements_df=movements_df,
+            id_column="id",
+            normalize_ids=True,
+            show_progress=True,
         )
-        
-        entries_from_alert = movements_df[mask_to_enterprise].copy()
-        entries_from_alert["typemove"] = "in"
-        entries_from_alert["id_farm"] = entries_from_alert["origen_id"]
-        entries_from_alert["farm_has_direct_alert"] = True
-        
-        # Usar producer_id_destino como idpro para movimientos hacia empresa
-        if "producer_id_destino" in entries_from_alert.columns:
-            entries_from_alert["idpro"] = entries_from_alert["producer_id_destino"]
-        
-        # 6. Identificar movimientos EMPRESA -> FINCA (empresa envía a finca con alerta)
-        # El tipo_origen indica que es una empresa
-        enterprise_types_orig = ["SLAUGHTERHOUSE", "CATTLE_FAIR", "PROCESSOR", "ENTERPRISE"]
-        
-        mask_from_enterprise = (
-            movements_df["destination_id"].isin(farms_with_alert) &
-            movements_df["tipo_origen"].isin(enterprise_types_orig) if "tipo_origen" in movements_df.columns 
-            else movements_df["destination_id"].isin(farms_with_alert)
-        )
-        
-        exits_to_alert = movements_df[mask_from_enterprise].copy()
-        exits_to_alert["typemove"] = "out"
-        exits_to_alert["id_farm"] = exits_to_alert["destination_id"]
-        exits_to_alert["farm_has_direct_alert"] = True
-        
-        # Usar producer_id_origen como idpro para movimientos desde empresa
-        if "producer_id_origen" in exits_to_alert.columns:
-            exits_to_alert["idpro"] = exits_to_alert["producer_id_origen"]
-        
-        # 7. Combinar resultados
-        result_df = pd.concat([entries_from_alert, exits_to_alert], ignore_index=True)
         
         if result_df.empty:
             logging.warning(f"No se encontraron movimientos con fincas alertadas para {period}")
@@ -359,38 +333,16 @@ def calculate_enterprise_alerts_for_period(
                 "error": "No movements with alerted farms"
             }
         
-        # 8. Agregar metadata
+        # Agregar metadata del período
         result_df["period"] = period
         result_df["year"] = year
         if quarter:
             result_df["quarter"] = quarter
         result_df["source"] = source
         
-        # 9. Asegurar que idpro existe
-        if "idpro" not in result_df.columns:
-            result_df["idpro"] = ""
-        
-        # 10. Seleccionar y ordenar columnas de salida
-        output_cols = ["idpro", "id_farm", "typemove", "period", "year", "farm_has_direct_alert"]
-        if quarter:
-            output_cols.insert(5, "quarter")
-        
-        # Agregar tipo de empresa si está disponible
-        if "tipo_destino" in result_df.columns or "tipo_origen" in result_df.columns:
-            def get_enterprise_type(row):
-                if row["typemove"] == "in":
-                    return row.get("tipo_destino", "")
-                else:
-                    return row.get("tipo_origen", "")
-            result_df["enterprise_type_raw"] = result_df.apply(get_enterprise_type, axis=1)
-            output_cols.append("enterprise_type_raw")
-        
-        # Filtrar columnas existentes
-        output_cols = [c for c in output_cols if c in result_df.columns]
-        result_df = result_df[output_cols]
-        
-        # 11. Eliminar duplicados (mismo idpro, id_farm, typemove)
-        result_df = result_df.drop_duplicates(subset=["idpro", "id_farm", "typemove"])
+        # Renombrar enterprise_type para compatibilidad
+        if "enterprise_type" in result_df.columns:
+            result_df["enterprise_type_raw"] = result_df["enterprise_type"]
         
         # 12. Agregar info de empresa si está disponible
         if enterprise_map:
@@ -407,8 +359,8 @@ def calculate_enterprise_alerts_for_period(
         result_df.to_csv(output_path, index=False, encoding="utf-8-sig")
         
         # Estadísticas
-        n_entries = len(entries_from_alert.drop_duplicates(subset=["idpro", "id_farm"]))
-        n_exits = len(exits_to_alert.drop_duplicates(subset=["idpro", "id_farm"]))
+        n_entries = (result_df["typemove"] == "in").sum()
+        n_exits = (result_df["typemove"] == "out").sum()
         unique_enterprises = result_df["idpro"].nunique()
         unique_farms = result_df["id_farm"].nunique()
         

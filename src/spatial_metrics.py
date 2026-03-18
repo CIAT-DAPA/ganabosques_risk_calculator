@@ -25,6 +25,7 @@ from shapely.geometry.base import BaseGeometry
 from tqdm import tqdm
 
 from config import config
+from ganabosques_risk_package.spatial_metrics import spatial_metrics as pkg_spatial_metrics
 
 # URLs de geoserver (sin maxFeatures para descargar todo)
 FRONTERA_WFS_URL = (
@@ -512,12 +513,19 @@ def calculate_spatial_metrics(
         
         metrics_df = parallel_result['results_df']
     else:
-        # Modo secuencial (original)
-        # 2) Cargar geometrías de farms
+        # Modo secuencial → usa ganabosques_risk_package.spatial_metrics
+        # 2) Cargar geometrías de farms como GeoDataFrame
         farms_gdf = load_farm_geometries(farms_metadata, data_manager, crs)
         
-        # 3) Calcular métricas
-        metrics_df = compute_metrics_for_farms(farms_gdf, frontier_gdf, protected_gdf)
+        # 3) Calcular métricas con el paquete reutilizable
+        metrics_df = pkg_spatial_metrics(
+            plots=farms_gdf,
+            farming_areas=frontier_gdf,
+            protected_areas=protected_gdf,
+            crs=crs,
+            id_column="id",
+            show_progress=True,
+        )
     
     # 4) Guardar resultados
     if output_dir is None:

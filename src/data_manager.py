@@ -49,7 +49,7 @@ class DataManager:
     ├── farms/
     │   └── geojsons/
     │       ├── [sitcode].geojson
-    │       └── [mongo_id].geojson
+    │       └── [geofarmerid].geojson
     ├── rasters/
     │   └── smbyc/
     │       ├── annual/

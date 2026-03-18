@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Optional, Set
 from datetime import datetime
 import pandas as pd
 from tqdm import tqdm
+from ganabosques_risk_package.alert_indirect import alert_indirect as pkg_alert_indirect
 
 
 # ===================== UTILIDADES =====================
@@ -458,8 +459,13 @@ def calculate_indirect_alerts(
         
         logging.info(f"Movimientos cargados: {len(movements_df):,}")
         
-        # 4. Calcular métricas de alertas indirectas
-        result_df = calculate_indirect_metrics(alerts_df, movements_df, period)
+        # 4. Calcular métricas de alertas indirectas (usa ganabosques_risk_package)
+        result_df = pkg_alert_indirect(
+            alert_direct_df=alerts_df,
+            movements_df=movements_df,
+            id_column="id",
+            show_progress=True,
+        )
         
         # 5. Agregar metadata
         result_df.insert(0, "period", period)
