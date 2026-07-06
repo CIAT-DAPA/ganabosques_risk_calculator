@@ -4,17 +4,17 @@
 import os
 import re
 import time
+from pathlib import Path
 import logging
-from typing import Dict, Any, List, Optional, Tuple, Set
+from typing import Dict, Any, List, Optional, Set
 
-import numpy as np
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry.base import BaseGeometry
 from tqdm import tqdm
 
 from config import config
 from ganabosques_risk_package.total_risk import total_risk as pkg_total_risk
+from utils import area_ha, compute_intersection_area_ha_via_sindex, parse_year_periods, normalize_farm_id, setup_logging
 
 # --- ORM (preferido) o fallback sin conexión
 try:
@@ -27,53 +27,8 @@ except ImportError:
     FarmPolygons = None
 
 # ===================== logging =====================
-def setup_logging():
-    lvl = getattr(logging, str(config.get("LOG_LEVEL", "WARNING")).upper(), logging.WARNING)
-    logging.basicConfig(
-        filename=config.get("LOG_FILE", "risk_postprocess.log"),
-        level=lvl,
-        format="%(asctime)s %(levelname)s:%(message)s"
-    )
-    console = logging.StreamHandler()
-    console.setLevel(lvl)
-    console.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    logging.getLogger().addHandler(console)
-
-# ===================== normalización de IDs =====================
-_FARM_ID_PREFIX = re.compile(r'^FARM_ID_', re.IGNORECASE)
-
-def _norm_id(s) -> str:
-    """Normaliza IDs: str + trim, quita prefijo FARM_ID_, elimina '.0',
-    quita ceros a la izquierda si es numérico, upper()."""
-    if s is None:
-        return ""
-    s = str(s).strip()
-    # Quitar prefijo FARM_ID_ (viene de geojsons de cacao/geofarmer)
-    s = _FARM_ID_PREFIX.sub('', s)
-    if s.endswith(".0"):
-        try:
-            s = str(int(float(s)))
-        except Exception:
-            pass
-    if s.isdigit():
-        try:
-            s = str(int(s))
-        except Exception:
-            s = s.lstrip("0") or "0"
-    return s
 
 # ===================== placeholders =====================
-def parse_year_periods(years_raw: str) -> List[str]:
-    if not years_raw:
-        return []
-    parts = [p.strip() for p in str(years_raw).split(",") if p.strip()]
-    valids = []
-    for p in parts:
-        if re.match(r"^\d{4}\s*-\s*\d{4}$", p):
-            valids.append(p.replace(" ", ""))
-        else:
-            logging.warning(f"YEARS ignorado por formato no válido: '{p}' (usa AAAA-AAAA)")
-    return valids
 
 def derive_mov_year(years_range: str, periodo: str) -> str:
     if not years_range or "-" not in years_range:
@@ -128,8 +83,6 @@ def list_geojsons(folder: str) -> List[str]:
     return sorted(out)
 
 # ===================== geo helpers =====================
-def area_ha(geom: BaseGeometry) -> float:
-    return float(geom.area / 10_000.0)
 
 def assert_crs_exact(gdf: gpd.GeoDataFrame, expected_crs: str, label: str):
     if gdf.crs is None:
@@ -137,36 +90,6 @@ def assert_crs_exact(gdf: gpd.GeoDataFrame, expected_crs: str, label: str):
     crs_str = gdf.crs.to_string()
     if crs_str != expected_crs:
         raise RuntimeError(f"{label}: CRS={crs_str} difiere de esperado {expected_crs}. Corrige/reproyecta offline.")
-
-def compute_intersection_area_ha_via_sindex(farm_geom: BaseGeometry, mask_gdf: gpd.GeoDataFrame) -> float:
-    if mask_gdf is None or mask_gdf.empty:
-        return 0.0
-    try:
-        sidx = mask_gdf.sindex
-    except Exception:
-        sidx = None
-    cand_idx = list(sidx.intersection(farm_geom.bounds)) if sidx is not None else list(range(len(mask_gdf)))
-    if not cand_idx:
-        return 0.0
-    mask_sub = mask_gdf.iloc[cand_idx]
-    mask_sub = mask_sub[mask_sub.intersects(farm_geom)]
-    if mask_sub.empty:
-        return 0.0
-    covered = None
-    for mg in mask_sub.geometry:
-        try:
-            inter = farm_geom.intersection(mg)
-        except Exception:
-            try:
-                inter = farm_geom.buffer(0).intersection(mg.buffer(0))
-            except Exception:
-                continue
-        if inter.is_empty:
-            continue
-        covered = inter if covered is None else covered.union(inter)
-    if covered is None or covered.is_empty:
-        return 0.0
-    return area_ha(covered)
 
 def load_farms_geoms_reproject(folder_tpl: str, empresa: str, expected_crs: str) -> gpd.GeoDataFrame:
     base_ctx = {"EMPRESA": empresa, "PERIODO": "", "YEARS": "", "MOV_YEAR": ""}
@@ -273,7 +196,7 @@ def scan_ids_needed(years_list: List[str], sources: List[str], empresa: str, per
             if os.path.isfile(a_csv):
                 try:
                     df = pd.read_csv(a_csv, dtype=str, usecols=["id"])
-                    ids.update(df["id"].map(_norm_id))
+                    ids.update(df["id"].map(normalize_farm_id))
                 except Exception:
                     pass
             m_dir = movement_dir_from_output_csv(config["MOVEMENT_RISK_OUTPUT_CSV"], ctx, src, empresa)
@@ -281,7 +204,7 @@ def scan_ids_needed(years_list: List[str], sources: List[str], empresa: str, per
             if os.path.isfile(m_csv):
                 try:
                     dfm = pd.read_csv(m_csv, dtype=str, usecols=["id"])
-                    ids.update(dfm["id"].map(_norm_id))
+                    ids.update(dfm["id"].map(normalize_farm_id))
                 except Exception:
                     pass
     ids.discard("")
@@ -369,7 +292,7 @@ def build_mongo_maps(ids_needed: Set[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
 
     # ids normalizados (strings tipo "396204")
-    ids_str = [_norm_id(x) for x in ids_needed if _norm_id(x) != ""]
+    ids_str = [normalize_farm_id(x) for x in ids_needed if normalize_farm_id(x) != ""]
     ids_str = list(dict.fromkeys(ids_str))  # únicos y orden estable
 
     print(f"ORM ▶ IDs a buscar: {len(ids_str)} (ejemplos: {ids_str[:8]})") 
@@ -402,7 +325,7 @@ def build_mongo_maps(ids_needed: Set[str]) -> pd.DataFrame:
                     try:
                         source_str = ext.source.value if hasattr(ext.source, 'value') else str(ext.source)
                         if source_str == "SIT_CODE":
-                            code = _norm_id(str(ext.ext_code))
+                            code = normalize_farm_id(str(ext.ext_code))
                             if code in ids_str and code not in farm_map:
                                 farm_map[code] = farm_id
                     except Exception:
@@ -411,7 +334,7 @@ def build_mongo_maps(ids_needed: Set[str]) -> pd.DataFrame:
         # Buscar IDs no encontrados por GEOFARMER_ID (cacao)
         missing_ids = [sid for sid in ids_str if sid not in farm_map]
         if missing_ids:
-            # Los ext_code en BD pueden tener prefijo FARM_ID_ que _norm_id quita,
+            # Los ext_code en BD pueden tener prefijo FARM_ID_ que normalize_farm_id quita,
             # así que buscamos con ambas variantes
             search_ids = list(set(missing_ids + [f"FARM_ID_{sid}" for sid in missing_ids]))
             farms_geo = Farm.objects(
@@ -429,7 +352,7 @@ def build_mongo_maps(ids_needed: Set[str]) -> pd.DataFrame:
                         try:
                             source_str = ext.source.value if hasattr(ext.source, 'value') else str(ext.source)
                             if source_str == "GEOFARMER_ID":
-                                code = _norm_id(str(ext.ext_code))
+                                code = normalize_farm_id(str(ext.ext_code))
                                 if code in ids_str and code not in farm_map:
                                     farm_map[code] = farm_id
                         except Exception:
@@ -518,7 +441,7 @@ def process_year_source(empresa: str, periodo: str, years: str, mov_year: str,
         return None
 
     # Normaliza id
-    df_direct["id"] = df_direct["id"].map(_norm_id)
+    df_direct["id"] = df_direct["id"].map(normalize_farm_id)
 
     # Asegura columnas directas solicitadas
     if "direct_alert" not in df_direct.columns:
@@ -542,7 +465,7 @@ def process_year_source(empresa: str, periodo: str, years: str, mov_year: str,
             write_reason_log(total_dir, log_name, f"[{years}] MOVEMENT sin columna 'id'. Se generará con 'no_info'.")
             df_move = None
         else:
-            df_move["id"] = df_move["id"].map(_norm_id)
+            df_move["id"] = df_move["id"].map(normalize_farm_id)
     else:
         write_reason_log(total_dir, log_name, f"[{years}] Falta movimiento: {movement_alert_csv}")
         df_move = None
@@ -581,6 +504,27 @@ def process_year_source(empresa: str, periodo: str, years: str, mov_year: str,
             final["farm_id"] = ""
         if "farm_poligons_id" not in final.columns:
             final["farm_poligons_id"] = ""
+
+        # --- Fallback usando diccionario  ---
+        if "GEOFARMER_ID" in mongo_map_df.columns:
+            geo_map = (
+                mongo_map_df[["GEOFARMER_ID", "farm_id", "farm_poligons_id"]]
+                .dropna(subset=["GEOFARMER_ID"])
+            )
+
+            geo_map["GEOFARMER_ID"] = geo_map["GEOFARMER_ID"].astype(str).str.strip()
+            geo_map = geo_map[geo_map["GEOFARMER_ID"] != ""].drop_duplicates("GEOFARMER_ID")
+
+            # Crear diccionarios para lookup rápido
+            farm_id_map = dict(zip(geo_map["GEOFARMER_ID"], geo_map["farm_id"]))
+            poly_map = dict(zip(geo_map["GEOFARMER_ID"], geo_map["farm_poligons_id"]))
+
+            # Rellenar SOLO donde falte
+            mask = final["farm_id"] == ""
+
+            final.loc[mask, "farm_id"] = final.loc[mask, "id"].map(farm_id_map).fillna("")
+            final.loc[mask, "farm_poligons_id"] = final.loc[mask, "id"].map(poly_map).fillna("")
+
         print(f"⏱ Merge con Mongo maps: {time.perf_counter() - t4:.2f}s")
         # Prints de verificación rápida
         print("MONGO ▶ ejemplo de filas con farm_id asignado:")
@@ -703,8 +647,6 @@ def calculate_total_risk(
             'execution_time': float
         }
     """
-    from pathlib import Path
-    import time
     
     setup_logging()
     T0 = time.perf_counter()
@@ -726,7 +668,7 @@ def calculate_total_risk(
         print(f"📂 Cargando métricas precalculadas: {metrics_file}")
         try:
             metrics_df = pd.read_csv(metrics_file, dtype=str)
-            metrics_df["id"] = metrics_df["id"].apply(_norm_id)
+            metrics_df["id"] = metrics_df["id"].apply(normalize_farm_id)
             print(f"✅ Métricas cargadas: {len(metrics_df)} farms")
         except Exception as e:
             print(f"⚠ Error cargando métricas: {e}")
@@ -754,7 +696,7 @@ def calculate_total_risk(
         if direct_csv.exists():
             try:
                 df = pd.read_csv(direct_csv, dtype=str, usecols=['id'])
-                all_ids.update(df['id'].apply(_norm_id))
+                all_ids.update(df['id'].apply(normalize_farm_id))
             except Exception as e:
                 logging.warning(f"Error leyendo {direct_csv}: {e}")
         else:
@@ -765,7 +707,7 @@ def calculate_total_risk(
         if indirect_csv.exists():
             try:
                 df = pd.read_csv(indirect_csv, dtype=str, usecols=['id'])
-                all_ids.update(df['id'].apply(_norm_id))
+                all_ids.update(df['id'].apply(normalize_farm_id))
             except Exception as e:
                 logging.warning(f"Error leyendo {indirect_csv}: {e}")
         else:
@@ -779,12 +721,12 @@ def calculate_total_risk(
         # Usar mapeo precargado desde DataManager (evita consulta adicional a MongoDB)
         print(f"📦 Usando mapeo MongoDB precargado desde DataManager ({len(mongo_map_df)} farms)")
         # Filtrar solo los IDs que necesitamos
-        mongo_map_df = mongo_map_df[mongo_map_df['id'].isin(all_ids)].copy()
+        mongo_map_df = mongo_map_df[mongo_map_df['id'].isin(all_ids) | mongo_map_df['GEOFARMER_ID'].isin(all_ids)].copy()
         print(f"   • IDs filtrados: {len(mongo_map_df)}")
     else:
         # Fallback: construir mapeo consultando MongoDB directamente
         print("📊 Construyendo mapeo MongoDB (consulta directa)...")
-        mongo_map_df = build_mongo_maps(all_ids) if all_ids else pd.DataFrame(columns=['id', 'farm_id', 'farm_poligons_id'])
+        mongo_map_df = build_mongo_maps(all_ids) if all_ids else pd.DataFrame(columns=['id', 'farm_id', 'farm_poligons_id', 'GEOFARMER_ID'])
     
     # Procesar cada período
     files_generated = []
@@ -806,7 +748,7 @@ def calculate_total_risk(
             logging.warning(f"CSV sin columna 'id': {direct_csv}")
             continue
         
-        df_direct['id'] = df_direct['id'].apply(_norm_id)
+        df_direct['id'] = df_direct['id'].apply(normalize_farm_id)
         
         # Asegurar columna direct_alert
         if 'direct_alert' not in df_direct.columns:
@@ -824,7 +766,7 @@ def calculate_total_risk(
         if indirect_csv.exists():
             df_indirect = pd.read_csv(indirect_csv, dtype=str, low_memory=False)
             if 'id' in df_indirect.columns:
-                df_indirect['id'] = df_indirect['id'].apply(_norm_id)
+                df_indirect['id'] = df_indirect['id'].apply(normalize_farm_id)
             else:
                 df_indirect = pd.DataFrame({'id': df_direct['id'], **{c: 'no_info' for c in mov_cols}})
         else:
@@ -847,11 +789,44 @@ def calculate_total_risk(
         
         # Merge con mapeo MongoDB
         if not mongo_map_df.empty:
-            merged = pd.merge(merged, mongo_map_df, on='id', how='left')
+            # --- Merge principal por id ---
+            merged = pd.merge(
+                merged,
+                mongo_map_df[["id", "farm_id", "farm_poligons_id"]],
+                on="id",
+                how="left"
+            )
+
+            # Asegurar columnas
+            for col in ["farm_id", "farm_poligons_id"]:
+                if col not in merged.columns:
+                    merged[col] = ""
+
+            # --- Fallback: usar GEOFARMER_ID cuando no hubo match ---
+            if "GEOFARMER_ID" in mongo_map_df.columns:
+                geo_map = mongo_map_df[["GEOFARMER_ID", "farm_id", "farm_poligons_id"]].copy()
+                geo_map["GEOFARMER_ID"] = geo_map["GEOFARMER_ID"].astype(str).str.strip()
+                geo_map = geo_map.drop_duplicates("GEOFARMER_ID")
+
+                # Crear diccionarios
+                farm_map = dict(zip(geo_map["GEOFARMER_ID"], geo_map["farm_id"]))
+                poly_map = dict(zip(geo_map["GEOFARMER_ID"], geo_map["farm_poligons_id"]))
+
+                # Normalizar id
+                merged["id"] = merged["id"].astype(str).str.strip()
+
+                # Rellenar SOLO donde falta
+                mask = merged["farm_id"].isna() | (merged["farm_id"] == "")
+
+                merged.loc[mask, "farm_id"] = merged.loc[mask, "id"].map(farm_map)
+                merged.loc[mask, "farm_poligons_id"] = merged.loc[mask, "id"].map(poly_map)
+
+                # Limpiar NaN finales
+                merged["farm_id"] = merged["farm_id"].fillna("")
+                merged["farm_poligons_id"] = merged["farm_poligons_id"].fillna("")
         else:
-            merged['farm_id'] = ''
-            merged['farm_poligons_id'] = ''
-        
+            merged["farm_id"] = ""
+            merged["farm_poligons_id"] = ""
         # Guardar resultado
         output_dir.mkdir(parents=True, exist_ok=True)
         output_csv = output_dir / f"{source}_total_risk_{period_type}_{period}.csv"

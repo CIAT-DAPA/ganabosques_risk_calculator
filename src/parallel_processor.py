@@ -18,18 +18,20 @@ def process_farm_chunk(args: tuple) -> Dict[str, Any]:
     """
     Procesa un chunk de farms en un worker.
     
+    Lee directamente del farm_folder original (sin copias) usando lista de archivos del chunk.
+    
     Args:
-        args: Tupla con (chunk_id, farm_files, params)
+        args: Tupla con (chunk_id, chunk_files, params)
         
     Returns:
         Dict con estadísticas del chunk procesado
     """
-    chunk_id, farm_files, params = args
+    chunk_id, chunk_files, params = args
     
     # Importar aquí para evitar problemas de serialización
     from direct_alert import calculate_direct_alerts
     
-    # Crear directorio temporal para este chunk
+    # Crear directorio temporal para este chunk (solo para output)
     temp_base_dir = params.get('_temp_dir')
     if not temp_base_dir:
         return {
@@ -43,35 +45,21 @@ def process_farm_chunk(args: tuple) -> Dict[str, Any]:
     
     # Modificar output_csv para este chunk
     chunk_params = params.copy()
-    chunk_params['output_csv'] = str(temp_dir / "output.csv")
-    chunk_params['farm_folder'] = params['farm_folder']
-    chunk_params['farm_range'] = ''  # Procesar todos los files del chunk
+    chunk_output_anchor = temp_dir / "worker_output"
+    chunk_output_anchor.mkdir(parents=True, exist_ok=True)
+    chunk_params['output_csv'] = str(chunk_output_anchor / "output.csv")
+    chunk_params['farm_folder'] = params['farm_folder']  # Usar el original directamente
+    chunk_params['farm_range'] = ''
     
     # Remover parámetros internos (que empiezan con _) EXCEPTO los necesarios
     clean_params = {k: v for k, v in chunk_params.items() if not k.startswith('_')}
     
-    # Asegurar que raster_paths_dict se pase (no empieza con _ pero es crítico)
+    # Asegurar que raster_paths_dict se pase
     if 'raster_paths_dict' in params:
         clean_params['raster_paths_dict'] = params['raster_paths_dict']
     
-    # Crear symlinks/copiar solo los geojsons de este chunk
-    chunk_geojson_dir = temp_dir / "geojsons"
-    chunk_geojson_dir.mkdir(exist_ok=True)
-    
-    source_dir = Path(params['farm_folder'])
-    for farm_file in farm_files:
-        source = source_dir / farm_file
-        target = chunk_geojson_dir / farm_file
-        if source.exists() and not target.exists():
-            try:
-                # En Windows, crear hardlink es más rápido que copiar
-                os.link(str(source), str(target))
-            except:
-                # Fallback: copiar archivo
-                import shutil
-                shutil.copy2(str(source), str(target))
-    
-    clean_params['farm_folder'] = str(chunk_geojson_dir)
+    # Pasar explícitamente archivos del chunk para evitar listados globales por worker.
+    clean_params['_farm_files_subset'] = chunk_files
     
     try:
         result = calculate_direct_alerts(**clean_params)
@@ -88,7 +76,13 @@ def process_farm_chunk(args: tuple) -> Dict[str, Any]:
         }
 
 
-def combine_csv_results(temp_dirs: List[str], output_csv: str, period: str, source: str) -> int:
+def combine_csv_results(
+    temp_dirs: List[str],
+    output_csv: str,
+    period: str,
+    source: str,
+    period_type: str
+) -> int:
     """
     Combina los CSVs de todos los chunks en un solo archivo.
     
@@ -103,21 +97,17 @@ def combine_csv_results(temp_dirs: List[str], output_csv: str, period: str, sour
     """
     all_dfs = []
     
+    expected_name = f"{source.lower()}_direct_alert_{period_type.lower()}_{period}.csv"
+
     for temp_dir in temp_dirs:
-        # Buscar CSVs en subdirectorios por período
+        # Buscar CSV exacto del período dentro del árbol del chunk.
         temp_path = Path(temp_dir)
-        
-        # Buscar patrón: [SOURCE]/[PERIOD]/*.csv
-        source_upper = source.upper()
-        csv_pattern = f"{source_upper}/{period}/*.csv"
-        
-        csv_files = list(temp_path.glob(csv_pattern))
-        
+        csv_files = list(temp_path.glob(f"**/{expected_name}"))
+
+        # Fallback tolerante por si cambia el prefijo de source/tipo.
         if not csv_files:
-            # Intentar patrón alternativo si no encuentra
-            csv_pattern_alt = f"**/{source_upper}/{period}/*.csv"
-            csv_files = list(temp_path.glob(csv_pattern_alt))
-        
+            csv_files = list(temp_path.glob(f"**/*_direct_alert_*_{period}.csv"))
+
         for csv_file in csv_files:
             try:
                 df = pd.read_csv(csv_file)
@@ -216,8 +206,9 @@ def run_parallel_direct_alerts(
             break
         
         chunk_files = all_farm_files[start_idx:end_idx]
+        num_farms_in_chunk = len(chunk_files)
         chunks.append((i, chunk_files, params))
-        print(f"  • Worker {i+1}: {len(chunk_files):,} farms (índices {start_idx}-{end_idx-1})")
+        print(f"  • Worker {i+1}: {num_farms_in_chunk:,} farms (índices {start_idx}-{end_idx-1})")
     
     print(f"\n⚙️ Procesando {len(chunks)} chunks en paralelo...")
     
@@ -269,7 +260,7 @@ def run_parallel_direct_alerts(
         out_dir, final_csv = make_out_dir_and_paths(output_template, ctx, source, deforestation_type=period_type)
         
         # Combinar CSVs de este período
-        num_records = combine_csv_results(temp_dirs, final_csv, period, source)
+        num_records = combine_csv_results(temp_dirs, final_csv, period, source, period_type)
         combined_stats[period] = num_records
         
         print(f"  ✓ {period}: {num_records:,} registros → {final_csv}")
@@ -314,7 +305,8 @@ def process_metrics_chunk(args: tuple) -> Dict[str, Any]:
     chunk_id, farm_ids, params = args
     
     # Importar aquí para evitar problemas de serialización
-    from spatial_metrics import compute_metrics_for_farms, area_ha
+    # Usar la implementación del paquete para unificar lógica con la rama secuencial
+    from ganabosques_risk_package.spatial_metrics import spatial_metrics as pkg_spatial_metrics
     import geopandas as gpd
     
     try:
@@ -341,8 +333,15 @@ def process_metrics_chunk(args: tuple) -> Dict[str, Any]:
         
         farms_gdf = gpd.GeoDataFrame(rows, crs=crs)
         
-        # Calcular métricas
-        metrics_df = compute_metrics_for_farms(farms_gdf, frontier_gdf, protected_gdf)
+        # Calcular métricas usando la función del paquete (misma que la rama secuencial)
+        metrics_df = pkg_spatial_metrics(
+            plots=farms_gdf,
+            farming_areas=frontier_gdf,
+            protected_areas=protected_gdf,
+            crs=crs,
+            id_column="id",
+            show_progress=False,
+        )
         
         return {
             'chunk_id': chunk_id,

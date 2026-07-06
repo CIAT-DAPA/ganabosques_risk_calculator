@@ -13,7 +13,7 @@ import json
 import time
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import requests
 from requests.auth import HTTPBasicAuth
 from tqdm import tqdm
@@ -21,6 +21,7 @@ import geopandas as gpd
 import pandas as pd
 from bson import ObjectId
 from rtree import index
+from datetime import datetime
 
 try:
     from ganabosques_orm.collections.farm import Farm
@@ -70,7 +71,7 @@ class DataManager:
         geoserver_pass: str
     ):
         self.workspace_dir = Path(workspace_dir) / "alertas"
-        self.gs_url = geoserver_url.rstrip('/')
+        self.gs_url = (geoserver_url or "").rstrip('/')
         self.gs_auth = HTTPBasicAuth(geoserver_user, geoserver_pass)
         
         # Directorios de caché
@@ -89,10 +90,106 @@ class DataManager:
         self._geometries_cache = {}  # {farm_id: shapely.geometry}
         self._spatial_index = None  # R-tree index para búsqueda espacial rápida
         self._index_to_farm = {}  # {rtree_idx: farm_id}
+        self._geojson_stems_cache = None  # Set de nombres de geojson (sin extensión)
+        self._farmrisk_cache_by_analysis: Dict[str, Dict[str, Any]] = {}
         
         logging.info(f"DataManager inicializado: {self.workspace_dir}")
+
+    def _list_local_geojson_stems(self) -> set:
+        """Lista geojsons locales una sola vez y retorna stems para búsquedas O(1)."""
+        if self._geojson_stems_cache is None:
+            self._geojson_stems_cache = {
+                p.stem for p in self.geojsons_dir.glob("*.geojson") if p.is_file()
+            }
+        return self._geojson_stems_cache
+
+    def _invalidate_geojson_stems_cache(self) -> None:
+        """Invalida cache de stems cuando se crean nuevos geojsons."""
+        self._geojson_stems_cache = None
+
+    @staticmethod
+    def _chunked(items: List, chunk_size: int) -> List[List]:
+        """Divide una lista en chunks pequeños."""
+        return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+    @staticmethod
+    def _farm_ref_to_str(farm_ref) -> str:
+        """Convierte referencia de farm a string id estable."""
+        if hasattr(farm_ref, 'id'):
+            return str(farm_ref.id)
+        return str(farm_ref)
+
+    @staticmethod
+    def _normalize_external_farm_id(raw_id: Any) -> str:
+        """Normaliza IDs externos (SIT_CODE/GEOFARMER_ID) para matching consistente."""
+        if raw_id is None:
+            return ""
+        value = str(raw_id).strip()
+        if value in ['', 'nan', 'None']:
+            return ""
+        value = re.sub(r'^FARM_ID_', '', value, flags=re.IGNORECASE)
+        return value
+
+    def get_farmrisk_cache_for_analysis(self, analysis_id: Optional[str]) -> Dict[str, Any]:
+        """Retorna el cache de FarmRisk para un analysis_id (si existe)."""
+        if not analysis_id:
+            return {}
+        return self._farmrisk_cache_by_analysis.get(str(analysis_id), {})
+
+    def _build_preferred_polygon_map(self, farm_ids: List) -> Dict[str, str]:
+        """
+        Construye mapa farm_id -> polygon_id con estrategia rápida:
+        1) cualquiera con log.enable=True
+        2) fallback a cualquiera disponible.
+        """
+        preferred: Dict[str, str] = {}
+        if not farm_ids or not HAS_ORM:
+            return preferred
+
+        try:
+            enabled_docs = (
+                FarmPolygons.objects(farm_id__in=farm_ids, log__enable=True)
+                .only('id', 'farm_id')
+            )
+            for poly in enabled_docs:
+                farm_key = self._farm_ref_to_str(poly.farm_id)
+                if farm_key not in preferred:
+                    preferred[farm_key] = str(poly.id)
+
+            if len(preferred) < len(farm_ids):
+                fallback_docs = (
+                    FarmPolygons.objects(farm_id__in=farm_ids)
+                    .only('id', 'farm_id')
+                )
+                for poly in fallback_docs:
+                    farm_key = self._farm_ref_to_str(poly.farm_id)
+                    if farm_key not in preferred:
+                        preferred[farm_key] = str(poly.id)
+        except Exception as e:
+            logging.warning(f"Error construyendo mapa de polygons preferidos: {e}")
+
+        return preferred
+
+    def _get_preferred_farm_polygon(self, farm_id_obj) -> Optional[object]:
+        """Retorna FarmPolygon preferido para un farm (enable=True; fallback cualquiera)."""
+        if not HAS_ORM:
+            return None
+        try:
+            poly = FarmPolygons.objects(farm_id=farm_id_obj, log__enable=True).first()
+            if poly:
+                return poly
+            return FarmPolygons.objects(farm_id=farm_id_obj).first()
+        except Exception as e:
+            logging.warning(f"Error consultando polygon preferido para farm {farm_id_obj}: {e}")
+            return None
     
-    def load_farms_metadata(self, limit: Optional[int] = None, offline_mode: bool = False, value_chain: Optional[str] = None) -> Tuple[List[Dict], Optional[str]]:
+    def load_farms_metadata(
+        self,
+        limit: Optional[int] = None,
+        offline_mode: bool = False,
+        value_chain: Optional[str] = None,
+        refresh_data: bool = False,
+    ) -> Tuple[List[Dict], Optional[str]]:
         """
         Carga metadata de farms desde caché JSON o MongoDB (solo IDs, sin geojson).
         
@@ -100,6 +197,7 @@ class DataManager:
             limit: Número máximo de farms a cargar (None = todos)
             offline_mode: Si True, solo usa caché local, no conecta a MongoDB
             value_chain: Cadena de valor para filtrar farms ('livestock', 'cacao'). None = todos.
+            refresh_data: Si True, ignora caché y recarga metadata desde MongoDB.
         
         Returns:
             Tupla (metadata, error):
@@ -116,7 +214,7 @@ class DataManager:
         cache_suffix = f"_{value_chain}" if value_chain else ""
         cache_file = self.farms_dir / f"farms_metadata{cache_suffix}.json"
         
-        if cache_file.exists():
+        if cache_file.exists() and not refresh_data:
             print(f"📦 Cargando farms desde caché: {cache_file}")
             try:
                 with open(cache_file, 'r', encoding='utf-8') as f:
@@ -129,37 +227,12 @@ class DataManager:
                     print(f"✅ Cargados {len(metadata):,} farms desde caché")
                     self._farms_metadata = metadata
                 
-                # En modo offline, retornar directamente sin validar con BD
-                if offline_mode:
-                    print(f"🔌 Modo offline: usando caché sin validación")
-                    return (self._farms_metadata, None)
-                
-                # Validar caché contra BD (verificar count y sample de sit_codes)
-                if HAS_ORM:
-                    try:
-                        # Validar contra BD con mismo filtro de value_chain
-                        if value_chain:
-                            from ganabosques_orm.enums.valuechain import ValueChain as VC
-                            bd_count = Farm.objects(value_chain=VC(value_chain.lower())).count()
-                        else:
-                            bd_count = Farm.objects.count()
-                        cache_count = len(metadata)
-                        
-                        # Si difieren significativamente (>5%), invalidar caché
-                        if abs(bd_count - cache_count) / max(bd_count, 1) > 0.05:
-                            print(f"⚠ Caché desactualizado: BD={bd_count:,} vs caché={cache_count:,}")
-                            print(f"📊 Recargando desde MongoDB...")
-                            self._farms_metadata = None
-                            # Continuar para recargar desde BD
-                        else:
-                            return (self._farms_metadata, None)
-                    except Exception:
-                        # Si no podemos validar, usar el caché
-                        return (self._farms_metadata, None)
-                else:
-                    return (self._farms_metadata, None)
+                print(f"⚡ Usando caché local sin validación de cambios")
+                return (self._farms_metadata, None)
             except Exception as e:
                 print(f"⚠ Error leyendo caché, recargando desde MongoDB: {e}")
+        elif cache_file.exists() and refresh_data:
+            print(f"🔄 refresh_data=True: ignorando caché y recargando desde MongoDB")
         elif offline_mode:
             # Modo offline sin caché disponible
             error_msg = f"Modo offline: caché no encontrado en {cache_file}"
@@ -264,15 +337,7 @@ class DataManager:
         if farm_ids:
             print(f"📦 Cargando farm_polygon_ids para {len(farm_ids):,} farms...")
             try:
-                # Consulta batch de FarmPolygons
-                from bson import ObjectId
-                polygon_docs = FarmPolygons.objects(farm_id__in=farm_ids).only('id', 'farm_id')
-                
-                # Crear mapeo farm_id -> polygon_id
-                polygon_map = {}
-                for poly in polygon_docs:
-                    farm_oid = poly.farm_id.id if hasattr(poly.farm_id, 'id') else poly.farm_id
-                    polygon_map[str(farm_oid)] = str(poly.id)
+                polygon_map = self._build_preferred_polygon_map(farm_ids)
                 
                 # Actualizar metadata con polygon_ids
                 matched = 0
@@ -339,12 +404,13 @@ class DataManager:
         print(f"✅ Geojsons locales: {available:,} encontrados, {missing:,} faltantes")
         return available
     
-    def prepare_geojsons(self, farms_metadata: List[Dict]) -> int:
+    def prepare_geojsons(self, farms_metadata: List[Dict], force_download: bool = False) -> int:
         """
         Descarga geojsons desde MongoDB para los farms que no existan en caché.
         
         Args:
             farms_metadata: Lista de metadata de farms
+            force_download: Si True, redescarga todos los geojsons (sin verificar cache local)
             
         Returns:
             Número de geojsons disponibles (en caché + descargados)
@@ -354,22 +420,115 @@ class DataManager:
         available = 0
         downloaded = 0
         failed = 0
-        
-        for farm_meta in tqdm(farms_metadata, desc="Verificando geojsons", unit="farm"):
-            geojson_path = self.ensure_geojson_available(farm_meta)
-            
-            if geojson_path:
-                available += 1
-                # Verificar si fue descarga nueva (archivo reciente)
-                from pathlib import Path
-                path = Path(geojson_path)
-                if path.exists():
-                    import time
-                    age_seconds = time.time() - path.stat().st_mtime
-                    if age_seconds < 5:  # Creado en los últimos 5 segundos
+
+        def _write_geojson_from_doc(geojson_doc, sitcode: Optional[str], mongo_id: str) -> bool:
+            """Escribe el geojson obtenido de Mongo en disco sin sanitización."""
+            if not geojson_doc or not getattr(geojson_doc, 'geojson', None):
+                return False
+
+            try:
+                geojson_data = json.loads(geojson_doc.geojson)
+
+                if sitcode:
+                    output_path = self.geojsons_dir / f"{sitcode}.geojson"
+                else:
+                    output_path = self.geojsons_dir / f"{mongo_id}.geojson"
+
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    json.dump(geojson_data, f)
+
+                self._invalidate_geojson_stems_cache()
+                return True
+            except Exception as e:
+                logging.warning(f"Error guardando geojson {mongo_id}: {e}")
+                return False
+
+        def _load_enabled_geojson_docs(mongo_ids: List[str]) -> Dict[str, object]:
+            """Consulta geojsons habilitados en MongoDB por lotes de farm_id."""
+            docs_by_farm: Dict[str, object] = {}
+            if not HAS_ORM or not mongo_ids:
+                return docs_by_farm
+
+            valid_object_ids = []
+            for mongo_id in mongo_ids:
+                try:
+                    valid_object_ids.append(ObjectId(str(mongo_id)))
+                except Exception:
+                    continue
+
+            for chunk in self._chunked(valid_object_ids, 1000):
+                try:
+                    geojson_docs = (
+                        FarmPolygons.objects(farm_id__in=chunk, log__enable=True)
+                        .only('farm_id', 'geojson')
+                    )
+                    for doc in geojson_docs:
+                        farm_ref = doc.farm_id.id if hasattr(doc.farm_id, 'id') else doc.farm_id
+                        farm_key = str(farm_ref)
+                        if farm_key not in docs_by_farm:
+                            docs_by_farm[farm_key] = doc
+                except Exception as e:
+                    logging.warning(f"Error consultando geojsons habilitados en lote: {e}")
+
+            return docs_by_farm
+
+        if force_download:
+            print("🔄 force_download=True: redescargando todos los geojsons...")
+            farm_meta_chunks = self._chunked(farms_metadata, 5000)
+            for farm_chunk in tqdm(farm_meta_chunks, desc="Redescargando geojsons", unit="chunk"):
+                farm_ids = [meta.get('mongo_id') for meta in farm_chunk if meta.get('mongo_id') and meta.get('sitcode')]
+                docs_by_farm = _load_enabled_geojson_docs(farm_ids)
+
+                for farm_meta in farm_chunk:
+                    mongo_id = farm_meta.get('mongo_id')
+                    sitcode = farm_meta.get('sitcode')
+                    if not mongo_id or not sitcode:
+                        failed += 1
+                        continue
+
+                    doc = docs_by_farm.get(str(mongo_id))
+                    if _write_geojson_from_doc(doc, sitcode, str(mongo_id)):
+                        available += 1
                         downloaded += 1
-            else:
+                    else:
+                        failed += 1
+
+            print(f"✅ Geojsons: {available:,} disponibles ({downloaded:,} descargados, {failed:,} sin geojson)")
+            return available
+
+        local_stems = self._list_local_geojson_stems()
+        missing_meta: List[Dict] = []
+
+        # Pasada rápida en memoria: evita sanitización y exists() por archivo.
+        for farm_meta in farms_metadata:
+            sitcode = farm_meta.get('sitcode')
+            if not sitcode:
                 failed += 1
+                continue
+            if sitcode in local_stems:
+                available += 1
+            else:
+                missing_meta.append(farm_meta)
+
+        # Solo para faltantes se consulta/descarga desde BD.
+        missing_chunks = self._chunked(missing_meta, 5000)
+        for chunk in tqdm(missing_chunks, desc="Descargando geojsons faltantes", unit="chunk"):
+            farm_ids = [meta.get('mongo_id') for meta in chunk if meta.get('mongo_id') and meta.get('sitcode')]
+            docs_by_farm = _load_enabled_geojson_docs(farm_ids)
+
+            for farm_meta in chunk:
+                mongo_id = farm_meta.get('mongo_id')
+                sitcode = farm_meta.get('sitcode')
+                if not mongo_id or not sitcode:
+                    failed += 1
+                    continue
+
+                doc = docs_by_farm.get(str(mongo_id))
+                if _write_geojson_from_doc(doc, sitcode, str(mongo_id)):
+                    available += 1
+                    downloaded += 1
+                else:
+                    failed += 1
         
         if downloaded > 0:
             print(f"✅ Geojsons: {available:,} disponibles ({downloaded:,} descargados, {failed:,} sin geojson)")
@@ -416,7 +575,9 @@ class DataManager:
         
         try:
             from bson import ObjectId
-            farm_polygon = FarmPolygons.objects(farm_id=ObjectId(mongo_id)).first()
+            farm_polygon = FarmPolygons.objects(farm_id=ObjectId(mongo_id), log__enable=True).first()
+            if not farm_polygon:
+                farm_polygon = FarmPolygons.objects(farm_id=ObjectId(mongo_id)).first()
             
             if not farm_polygon or not farm_polygon.geojson:
                 logging.warning(f"Farm {mongo_id} sin geojson en MongoDB")
@@ -434,6 +595,8 @@ class DataManager:
             
             with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(geojson_data, f)
+
+            self._invalidate_geojson_stems_cache()
             
             logging.debug(f"Geojson guardado: {output_path.name}")
             return str(output_path)
@@ -441,6 +604,49 @@ class DataManager:
         except Exception as e:
             logging.error(f"Error descargando geojson {mongo_id}: {e}")
             return None
+
+    def _strip_unsupported_properties(self, geojson_data: Dict) -> bool:
+        """
+        Elimina propiedades conocidas que generan warnings de OGR/pyogrio.
+
+        Actualmente se limpia `centroid`, que suele venir como arreglo/lista
+        y provoca mensajes repetidos de "unsupported OGR type: 3".
+        """
+        changed = False
+
+        if not isinstance(geojson_data, dict):
+            return changed
+
+        features = []
+        gtype = geojson_data.get("type")
+
+        if gtype == "FeatureCollection":
+            features = geojson_data.get("features") or []
+        elif gtype == "Feature":
+            features = [geojson_data]
+
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
+            props = feature.get("properties")
+            if isinstance(props, dict) and "centroid" in props:
+                props.pop("centroid", None)
+                changed = True
+
+        return changed
+
+    def _sanitize_geojson_file(self, geojson_path: Path) -> None:
+        """Limpia propiedades incompatibles en un geojson cacheado (in-place)."""
+        try:
+            with open(geojson_path, 'r', encoding='utf-8') as f:
+                geojson_data = json.load(f)
+
+            if self._strip_unsupported_properties(geojson_data):
+                with open(geojson_path, 'w', encoding='utf-8') as f:
+                    json.dump(geojson_data, f)
+        except Exception:
+            # Si falla la sanitización, no interrumpir el flujo principal.
+            pass
     
     def ensure_raster_available(
         self,
@@ -582,16 +788,16 @@ class DataManager:
     
     def get_mongo_id_map_df(self, ids_filter: set = None) -> pd.DataFrame:
         """
-        Retorna DataFrame con mapeo sitcode -> farm_id -> farm_polygon_id.
+        Retorna DataFrame con mapeo sitcode/geofarmer_id -> farm_id -> farm_polygon_id.
         Usa los datos ya cargados en _farms_metadata (sin consulta adicional a MongoDB).
         
         Args:
-            ids_filter: Set de sitcodes a incluir (None = todos)
+            ids_filter: Set de ids externos a incluir (None = todos)
             
         Returns:
-            DataFrame con columnas ['id', 'farm_id', 'farm_poligons_id']
+            DataFrame con columnas ['id', 'farm_id', 'farm_poligons_id', 'GEOFARMER_ID']
         """
-        cols = ["id", "farm_id", "farm_poligons_id"]
+        cols = ["id", "farm_id", "farm_poligons_id", "GEOFARMER_ID"]
         
         if not self._farms_metadata:
             logging.warning("farms_metadata no cargado, retornando DataFrame vacío")
@@ -599,29 +805,31 @@ class DataManager:
         
         rows = []
         # Regex para quitar prefijo FARM_ID_ (consistente con _norm_id en total_alert)
-        import re
         farm_id_prefix = re.compile(r'^FARM_ID_', re.IGNORECASE)
         
         for meta in self._farms_metadata:
             sitcode = meta.get('sitcode')
-            if not sitcode:
+            geofarmer_id = meta.get('geofarmer_id', '') or ''
+            if not sitcode and not geofarmer_id:
                 continue
             
             # Normalizar: quitar FARM_ID_ prefix + uppercase para matching consistente
-            normalized_id = farm_id_prefix.sub('', sitcode).upper()
+            normalized_id = farm_id_prefix.sub('', sitcode) if sitcode else ""
+            
             
             # Filtrar si se especificó
-            if ids_filter and normalized_id not in ids_filter:
+            if ids_filter and normalized_id not in ids_filter and geofarmer_id not in ids_filter:
                 continue
             
             rows.append({
                 "id": normalized_id,
                 "farm_id": meta.get('mongo_id', ''),
-                "farm_poligons_id": meta.get('farm_polygon_id', '') or ''
+                "farm_poligons_id": meta.get('farm_polygon_id', '') or '',
+                "GEOFARMER_ID": geofarmer_id
             })
         
         df = pd.DataFrame(rows, columns=cols)
-        logging.info(f"Mapeo MongoDB: {len(df)} farms con sitcode")
+        logging.info(f"Mapeo MongoDB: {len(df)} farms con sitcode/geofarmer_id")
         return df
     
     def get_results_dir(self, stage: str, source: str = None, deforestation_type: str = None, period: str = None) -> Path:
@@ -711,6 +919,10 @@ class DataManager:
         import sys
         
         print("\n📦 Cargando geometrías en memoria...")
+
+        # Evitar ruido de warnings no críticos de drivers OGR durante lecturas masivas.
+        logging.getLogger("pyogrio").setLevel(logging.ERROR)
+        logging.getLogger("fiona").setLevel(logging.ERROR)
         
         loaded = 0
         failed = 0
@@ -736,6 +948,7 @@ class DataManager:
             farm_id = sitcode
             
             try:
+                self._sanitize_geojson_file(geojson_path)
                 gdf = gpd.read_file(str(geojson_path))
                 if gdf.empty or 'geometry' not in gdf.columns:
                     failed += 1
@@ -1046,6 +1259,7 @@ class DataManager:
         saved = 0
         failed = 0
         errors = []
+        farmrisk_map: Dict[str, Any] = {}
         
         # Obtener o crear Analysis
         try:
@@ -1111,7 +1325,7 @@ class DataManager:
                     farm_oid = farm.id
                     # Buscar FarmPolygons solo si no tenemos el ID
                     if not farm_polygon_oid:
-                        farm_polygon = FarmPolygons.objects(farm_id=farm.id).first()
+                        farm_polygon = self._get_preferred_farm_polygon(farm.id)
                         farm_polygon_oid = farm_polygon.id if farm_polygon else None
                 
                 # Crear atributos de deforestación
@@ -1175,12 +1389,18 @@ class DataManager:
                     )
                     farm_risk.save()
                 
+                external_farm_id_norm = self._normalize_external_farm_id(sitcode_id)
+                if external_farm_id_norm:
+                    farmrisk_map[external_farm_id_norm] = farm_risk.id
+
                 saved += 1
                 
             except Exception as e:
                 errors.append({"farm_id": str(row.get('id', '')), "error": str(e)})
                 failed += 1
         
+        self._farmrisk_cache_by_analysis[str(analysis_id)] = farmrisk_map
+        print(f"   🧠 Cache FarmRisk ({analysis_id[:8]}...): {len(farmrisk_map):,} referencias")
         print(f"✅ FarmRisk guardados: {saved:,} OK, {failed:,} errores")
         return (saved, failed, errors)
     
@@ -1212,6 +1432,7 @@ class DataManager:
         saved = 0
         failed = 0
         errors = []
+        farmrisk_map: Dict[str, Any] = {}
         
         # 1. Validar analysis_id
         try:
@@ -1254,15 +1475,19 @@ class DataManager:
             
             # Bulk insert
             if valid_docs:
-                chunk_saved, chunk_failed, insert_errors = self._bulk_insert_farm_risks(valid_docs)
+                chunk_saved, chunk_failed, insert_errors, chunk_farmrisk_map = self._bulk_insert_farm_risks(valid_docs)
                 saved += chunk_saved
                 failed += chunk_failed
                 errors.extend(insert_errors)
+                if chunk_farmrisk_map:
+                    farmrisk_map.update(chunk_farmrisk_map)
             
             # Agregar errores de preparación
             errors.extend(chunk_errors)
             failed += len(chunk_errors)
         
+        self._farmrisk_cache_by_analysis[str(analysis_id)] = farmrisk_map
+        print(f"   🧠 Cache FarmRisk ({analysis_id[:8]}...): {len(farmrisk_map):,} referencias")
         print(f"✅ FarmRisk bulk: {saved:,} insertados, {failed:,} errores")
         return (saved, failed, errors)
     
@@ -1330,8 +1555,7 @@ class DataManager:
             
             # Consulta batch de FarmPolygons
             if farm_ids:
-                polygons = FarmPolygons.objects(farm_id__in=farm_ids).only('id', 'farm_id')
-                farm_to_polygon = {str(poly.farm_id.id): str(poly.id) for poly in polygons}
+                farm_to_polygon = self._build_preferred_polygon_map(farm_ids)
                 
                 # Actualizar mapeo con polygon_ids
                 for sitcode, data in sitcode_to_farm.items():
@@ -1428,6 +1652,7 @@ class DataManager:
                     "farm_id": farm_oid,
                     "analysis_id": analysis_oid,
                     "farm_polygons_id": farm_polygon_oid,
+                    "external_farm_id": sitcode,
                     
                     # Atributos de deforestación
                     "deforestation": {
@@ -1466,15 +1691,15 @@ class DataManager:
         
         return (valid_docs, errors)
     
-    def _bulk_insert_farm_risks(self, docs: List[Dict]) -> Tuple[int, int, List[Dict]]:
+    def _bulk_insert_farm_risks(self, docs: List[Dict]) -> Tuple[int, int, List[Dict], Dict[str, Any]]:
         """
         Ejecuta bulk insert de documentos FarmRisk.
         
         Returns:
-            Tupla (saved, failed, errors)
+            Tupla (saved, failed, errors, inserted_refs)
         """
         if not docs:
-            return (0, 0, [])
+            return (0, 0, [], {})
         
         try:
             # Crear objetos FarmRisk desde dicts
@@ -1501,9 +1726,24 @@ class DataManager:
                 farm_risks.append(farm_risk)
             
             # Bulk insert
-            FarmRisk.objects.insert(farm_risks, load_bulk=False)
+            inserted = FarmRisk.objects.insert(farm_risks, load_bulk=False)
+
+            inserted_refs: Dict[str, Any] = {}
+            inserted_list = inserted if isinstance(inserted, list) else []
+
+            for idx, inserted_item in enumerate(inserted_list):
+                external_farm_id = self._normalize_external_farm_id(docs[idx].get("external_farm_id"))
+                if not external_farm_id:
+                    continue
+
+                if hasattr(inserted_item, 'id'):
+                    inserted_refs[external_farm_id] = inserted_item.id
+                    continue
+
+                inserted_oid = inserted_item
+                inserted_refs[external_farm_id] = inserted_oid
             
-            return (len(farm_risks), 0, [])
+            return (len(farm_risks), 0, [], inserted_refs)
             
         except Exception as e:
             # Si hay error en bulk insert, clasificar tipo de error
@@ -1516,12 +1756,13 @@ class DataManager:
             else:
                 error_type = f"Error de inserción: {e}"
             
-            return (0, len(docs), [{"error": error_type, "count": len(docs)}])
+            return (0, len(docs), [{"error": error_type, "count": len(docs)}], {})
     
     def save_enterprise_risk_to_db(
         self,
         enterprise_df: pd.DataFrame,
-        analysis_id: str
+        analysis_id: str,
+        farm_risk_map: Optional[Dict[str, Any]] = None
     ) -> Tuple[int, int, List[Dict]]:
         """
         Guarda resultados de riesgo de empresas en MongoDB (EnterpriseRisk).
@@ -1588,6 +1829,13 @@ class DataManager:
         
         grouped = enterprise_df.groupby('_group_key')
         
+        resolved_farmrisk_map = farm_risk_map if farm_risk_map is not None else self.get_farmrisk_cache_for_analysis(analysis_id)
+
+        if resolved_farmrisk_map:
+            print(f"   ⚡ Usando cache FarmRisk en memoria: {len(resolved_farmrisk_map):,} referencias")
+        else:
+            print("   ⚠ Cache FarmRisk vacío: usando consultas a MongoDB por fila")
+
         print(f"📤 Guardando {len(grouped):,} EnterpriseRisk en BD...")
         
         for group_key, group in tqdm(grouped, desc="Guardando EnterpriseRisk", unit="emp"):
@@ -1636,16 +1884,24 @@ class DataManager:
                 for _, row in group.iterrows():
                     farm_id = str(row.get('id_farm', ''))
                     typemove = str(row.get('typemove', '')).lower()
-                    
-                    # Buscar FarmRisk correspondiente
-                    farm = Farm.objects(ext_id__source="SIT_CODE", ext_id__ext_code=farm_id).first()
-                    if not farm:
-                        continue
-                    
-                    farm_risk = FarmRisk.objects(
-                        farm_id=farm.id,
-                        analysis_id=analysis.id
-                    ).first()
+
+                    farm_risk = None
+                    farm_id_norm = self._normalize_external_farm_id(farm_id)
+
+                    # Ruta rápida: obtener FarmRisk directo del caché sin resolver en MongoDB.
+                    if farm_id_norm and resolved_farmrisk_map:
+                        farm_risk = resolved_farmrisk_map.get(farm_id_norm)
+
+                    # Fallback: comportamiento anterior consultando MongoDB.
+                    if not farm_risk:
+                        farm = Farm.objects(ext_id__source="SIT_CODE", ext_id__ext_code=farm_id).first()
+                        if not farm:
+                            continue
+
+                        farm_risk = FarmRisk.objects(
+                            farm_id=farm.id,
+                            analysis_id=analysis.id
+                        ).first()
                     
                     if farm_risk:
                         if typemove == 'in':
@@ -1661,15 +1917,23 @@ class DataManager:
                 
                 if ent_risk:
                     # Actualizar (agregar a las listas existentes sin duplicar)
-                    existing_input_ids = {str(r.id) for r in ent_risk.risk_input or []}
-                    existing_output_ids = {str(r.id) for r in ent_risk.risk_output or []}
+                    existing_input_ids = {
+                        str(r.id) if hasattr(r, 'id') else str(r)
+                        for r in ent_risk.risk_input or []
+                    }
+                    existing_output_ids = {
+                        str(r.id) if hasattr(r, 'id') else str(r)
+                        for r in ent_risk.risk_output or []
+                    }
                     
                     for ref in risk_input_refs:
-                        if str(ref.id) not in existing_input_ids:
+                        ref_id = str(ref.id) if hasattr(ref, 'id') else str(ref)
+                        if ref_id not in existing_input_ids:
                             ent_risk.risk_input.append(ref)
                     
                     for ref in risk_output_refs:
-                        if str(ref.id) not in existing_output_ids:
+                        ref_id = str(ref.id) if hasattr(ref, 'id') else str(ref)
+                        if ref_id not in existing_output_ids:
                             ent_risk.risk_output.append(ref)
                     
                     ent_risk.save()
@@ -1767,9 +2031,7 @@ class DataManager:
         """
         if not HAS_ORM:
             return (None, "ganabosques_orm no disponible")
-        
-        from bson import ObjectId
-        from datetime import datetime
+         
         
         try:
             deforestation = Deforestation.objects(id=ObjectId(deforestation_id)).first()

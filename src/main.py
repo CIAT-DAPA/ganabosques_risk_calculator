@@ -8,6 +8,9 @@ Etapas:
   2. Alertas Indirectas: Movimientos de ganado desde/hacia predios con alertas
   3. Métricas Espaciales: Cálculo de frontera agrícola y áreas protegidas
   4. Riesgo Total: Consolidación de todas las alertas y métricas
+  5. Alertas por Empresa: Cálculo de riesgo por empresa (agrícola/ganadera)
+  6. Alertas por Proveedor: Cálculo de riesgo por proveedor (ganadería)
+  7. Riesgo por ADM3: Cálculo de riesgo por unidad administrativa (municipio, departamento)
 
 Autor: CIAT-DAPA
 Fecha: 2026
@@ -24,39 +27,11 @@ from datetime import datetime
 from config import config
 from parallel_processor import run_parallel_direct_alerts
 from direct_alert import calculate_direct_alerts
-from indirect_alert_refactored import calculate_indirect_alerts_batch
-from enterprise_alert_calculator import calculate_enterprise_alerts_batch
-from adm3_risk_calculator import calculate_adm3_risk_batch, save_adm3_risk_from_csv_batch
-from supplier_risk_calculator import calculate_and_save_supplier_risk
-
-# ===================== SETUP LOGGING =====================
-def setup_logging(log_level: str = "WARNING", log_file: str = "pipeline.log"):
-    """Configura logging centralizado para todo el pipeline."""
-    lvl = getattr(logging, log_level.upper(), logging.WARNING)
-    
-    # Remover handlers existentes
-    root = logging.getLogger()
-    for h in list(root.handlers):
-        root.removeHandler(h)
-    
-    # Formato
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    
-    # Handler para archivo
-    fh = logging.FileHandler(log_file, encoding='utf-8')
-    fh.setLevel(lvl)
-    fh.setFormatter(fmt)
-    
-    # Handler para consola (solo WARNING+)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.WARNING)
-    ch.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    
-    root.setLevel(lvl)
-    root.addHandler(fh)
-    root.addHandler(ch)
-    
-    return logging.getLogger(__name__)
+from indirect_alert import calculate_indirect_alerts_batch
+from enterprise_alert import calculate_enterprise_alerts_batch
+from adm3_alert import calculate_adm3_risk_batch, save_adm3_risk_from_csv_batch
+from supplier_alert import calculate_and_save_supplier_risk
+from utils import setup_logging
 
 # ===================== IMPORTACIONES OPCIONALES =====================
 # Importar ORM para consultar capas de deforestación
@@ -161,7 +136,11 @@ def validate_prerequisites(
     data_manager: Optional['DataManager'],
     farms_metadata: Optional[List[Dict]],
     periods: List[str],
-    workspace_dir: Optional[Path] = None
+    workspace_dir: Optional[Path] = None,
+    offline_mode: bool = False,
+    geojsons_folder: str = "",
+    source: str = "smbyc",
+    period_type: str = "annual",
 ) -> Tuple[bool, str]:
     """
     Valida que existan los prerequisitos necesarios para ejecutar una etapa.
@@ -177,6 +156,17 @@ def validate_prerequisites(
         Tupla (is_valid, error_message)
     """
     errors = []
+
+    def has_direct_alerts_outputs(base_dir: Path) -> bool:
+        """Valida alertas directas para source/period_type/períodos solicitados."""
+        results_dir = base_dir / "results"
+        src = (source or "").lower()
+        ptype = (period_type or "").lower()
+
+        # Nueva estructura: results/{source}/{period_type}/direct_alerts/
+        specific_dir = results_dir / src / ptype / "direct_alerts"
+        print(f"🔍 Validando alertas directas en: {specific_dir}")
+        return specific_dir.exists() and specific_dir.is_dir()
     
     # Validaciones comunes
     if not periods:
@@ -184,16 +174,29 @@ def validate_prerequisites(
     
     # Validaciones por etapa
     if stage == 'direct':
-        if not data_manager:
-            errors.append("DataManager no disponible - se necesita para gestionar rasters")
-        if not farms_metadata:
-            # No es error fatal si hay geojsons en disco
-            if data_manager and data_manager.geojsons_dir.exists():
-                geojsons = list(data_manager.geojsons_dir.glob("*.geojson"))
-                if not geojsons:
-                    errors.append("No hay geojsons disponibles (ni en BD ni en disco)")
+        if offline_mode:
+            # En offline solo se requiere carpeta local con geojsons.
+            if not geojsons_folder:
+                errors.append("Modo offline: FOLDER_GEOJSONS no está configurado")
             else:
-                errors.append("No hay farms_metadata y no se encontró carpeta de geojsons")
+                gdir = Path(geojsons_folder)
+                if not gdir.exists() or not gdir.is_dir():
+                    errors.append(f"Modo offline: carpeta de geojsons no existe: {gdir}")
+                else:
+                    geojsons = list(gdir.glob("*.geojson"))
+                    if not geojsons:
+                        errors.append(f"Modo offline: no hay .geojson en {gdir}")
+        else:
+            if not data_manager:
+                errors.append("DataManager no disponible - se necesita para gestionar rasters")
+            if not farms_metadata:
+                # No es error fatal si hay geojsons en disco
+                if data_manager and data_manager.geojsons_dir.exists():
+                    geojsons = list(data_manager.geojsons_dir.glob("*.geojson"))
+                    if not geojsons:
+                        errors.append("No hay geojsons disponibles (ni en BD ni en disco)")
+                else:
+                    errors.append("No hay farms_metadata y no se encontró carpeta de geojsons")
     
     elif stage == 'movement':
         if workspace_dir:
@@ -207,15 +210,19 @@ def validate_prerequisites(
         
         # Verificar que existan alertas directas
         if workspace_dir:
-            direct_alerts_dir = workspace_dir / "results" / "direct_alerts"
-            if not direct_alerts_dir.exists():
+            if not has_direct_alerts_outputs(workspace_dir):
                 errors.append("No hay alertas directas previas - ejecuta --direct primero")
     
     elif stage == 'metrics':
         if not data_manager:
             errors.append("DataManager requerido para métricas espaciales")
         if not farms_metadata:
-            errors.append("farms_metadata requerido para métricas espaciales")
+            if data_manager and data_manager.geojsons_dir.exists():
+                geojsons = list(data_manager.geojsons_dir.glob("*.geojson"))
+                if not geojsons:
+                    errors.append("No hay geojsons disponibles (ni en BD ni en disco)")
+            else:
+                errors.append("No hay farms_metadata y no se encontró carpeta de geojsons")
     
     elif stage == 'enterprise':
         if workspace_dir:
@@ -228,14 +235,12 @@ def validate_prerequisites(
                     errors.append("No hay archivos de movimientos (movement_data_base_YYYY.csv)")
         
             # Verificar que existan alertas directas
-            direct_alerts_dir = workspace_dir / "results" / "direct_alerts"
-            if not direct_alerts_dir.exists():
+            if not has_direct_alerts_outputs(workspace_dir):
                 errors.append("No hay alertas directas previas - ejecuta --direct primero")
     
     elif stage == 'total':
         if workspace_dir:
-            direct_alerts_dir = workspace_dir / "results" / "direct_alerts"
-            if not direct_alerts_dir.exists():
+            if not has_direct_alerts_outputs(workspace_dir):
                 errors.append("No hay alertas directas - ejecuta --direct primero")
             
             # metrics es opcional pero recomendado
@@ -462,17 +467,8 @@ def run_direct_alerts(titulo: str, continue_on_error: bool, params: Dict[str, An
             source_lower = params['source'].lower()
             period_type = params['period_type']
             
-            # TEMPORAL: Mantener estructura antigua para NAD/ATD hasta que geoserver cambie
-            if period_type in ["nad", "atd"]:
-                # Estructura antigua: rasters/nad/quarter/nad_deforestation_quarter_YYYYQQ.tif
-                source_folder = rasters_base / period_type / "quarter"
-                expected_pattern = lambda pt, pn: f"{pt}_deforestation_quarter_{pn}.tif"
-                # FUTURA: source_folder = rasters_base / source_lower / period_type
-                # FUTURA: expected_pattern = lambda pt, pn: f"{source_lower}_deforestation_{pt}_{pn}.tif"
-            else:
-                # Estructura para SMBYC annual/cumulative
-                source_folder = rasters_base / source_lower / period_type
-                expected_pattern = lambda pt, pn: f"{source_lower}_deforestation_{pt}_{pn}.tif"
+            source_folder = rasters_base / source_lower / period_type
+            expected_pattern = lambda pt, pn: f"{source_lower}_deforestation_{pt}_{pn}.tif"
             
             if not source_folder.exists():
                 print(f"⚠ Carpeta de rasters no existe: {source_folder}")
@@ -563,22 +559,30 @@ def run_spatial_metrics(titulo: str, continue_on_error: bool, params: Dict[str, 
         farms_metadata = params.get('_farms_metadata')
         use_parallel = params.get('_use_parallel', False)
         num_workers = params.get('_num_workers')
+        farm_limit = params.get('_farm_limit')
         
         if not data_manager:
             print("❌ Error: DataManager no disponible")
             return False
         
         if not farms_metadata:
-            print("❌ Error: No hay metadata de farms disponible")
-            print("   Asegúrate de tener conexión a MongoDB")
-            return False
+            geojson_count = 0
+            if hasattr(data_manager, 'geojsons_dir') and data_manager.geojsons_dir.exists():
+                geojson_count = len(list(data_manager.geojsons_dir.glob("*.geojson")))
+
+            if geojson_count == 0:
+                print("❌ Error: No hay metadata de farms ni GeoJSONs locales disponibles")
+                return False
+
+            print(f"📂 Modo offline/mixto: usando GeoJSONs locales ({geojson_count:,}) para métricas")
         
         # Calcular métricas (con soporte paralelo)
         result = calculate_spatial_metrics(
             farms_metadata=farms_metadata,
             data_manager=data_manager,
             use_parallel=use_parallel,
-            num_workers=num_workers
+            num_workers=num_workers,
+            farm_limit=farm_limit
         )
         
         if result['success']:
@@ -917,7 +921,12 @@ def run_save_to_db(titulo: str, continue_on_error: bool, params: Dict[str, Any])
         if ent_csv.exists():
             try:
                 df = pd.read_csv(ent_csv)
-                saved, failed, errors = data_manager.save_enterprise_risk_to_db(df, analysis_id)
+                farm_risk_map = data_manager.get_farmrisk_cache_for_analysis(analysis_id)
+                saved, failed, errors = data_manager.save_enterprise_risk_to_db(
+                    df,
+                    analysis_id,
+                    farm_risk_map=farm_risk_map
+                )
                 total_ent_saved += saved
                 total_ent_failed += failed
                 print(f"   💾 EnterpriseRisk: {saved} guardados, {failed} fallidos")
@@ -986,6 +995,7 @@ Pasos disponibles:
   6: Guardar FarmRisk/EnterpriseRisk en MongoDB
   7: Calcular riesgo ADM3 (genera CSVs para revisión)
   8: Guardar ADM3 Risk en MongoDB (lee CSVs del paso 7)
+  9: Calcular riesgo por suppliers (requiere datos de suppliers en BD)
 
 Ejemplos de uso:
   # Pipeline completo (pasos 1-5):
@@ -1061,6 +1071,8 @@ Ejemplos de uso:
                        help="Número de divisiones por píxel (ej: 5 = 5×5 = 25 sub-píxeles). Solo aplica con --precise-area. Default: 5")
     parser.add_argument("--offline", action="store_true",
                        help="Modo offline: usar solo archivos locales, no conectar a MongoDB")
+    parser.add_argument("--refresh-data", action="store_true",
+                       help="Forzar recarga desde MongoDB: ignora caché de metadata y redescarga geojsons")
     
     # Optimización de base de datos
     parser.add_argument("--bulk-insert", action="store_true",
@@ -1304,7 +1316,7 @@ Ejemplos de uso:
         # Determinar si necesitamos cargar geometrías (solo para pasos 1 y 3)
         needs_geometries = 'direct' in stages_to_run or 'metrics' in stages_to_run
         
-        # Inicializar DataManager si está disponible
+        # Inicializar DataManager si está disponible (también en offline para gestionar rutas)
         data_manager = None
         farms_metadata = None  # Inicializar para que esté disponible fuera del bloque
         geojsons_folder = config.get('FOLDER_GEOJSONS', '')  # Fallback por defecto
@@ -1312,7 +1324,8 @@ Ejemplos de uso:
         if HAS_DATA_MANAGER:
             try:
                 workspace_dir = config.get('WORKSPACE_DIR')
-                gs_url = config.get('GEOSERVER_URL') if not offline_mode else None  # No conectar en offline
+                # En offline se usa DataManager solo para rutas locales; sin llamadas a geoserver.
+                gs_url = config.get('GEOSERVER_URL') if not offline_mode else ''
                 gs_user = config.get('GEOSERVER_USER', 'admin')
                 gs_pass = config.get('GEOSERVER_PASS', 'geoserver')
                 
@@ -1324,66 +1337,71 @@ Ejemplos de uso:
                         geoserver_pass=gs_pass
                     )
                     if offline_mode:
-                        print(f"✅ DataManager inicializado en modo OFFLINE: {workspace_dir}")
+                        print(f"✅ DataManager inicializado en modo OFFLINE (solo rutas): {workspace_dir}")
+                        geojsons_folder = str(data_manager.geojsons_dir)
+                        local_geojsons = len(list(data_manager.geojsons_dir.glob("*.geojson")))
+                        print(f"📂 GeoJSONs locales detectados: {local_geojsons:,} en {geojsons_folder}")
+                        farms_metadata = None
+                        geom_stats = {'loaded': 0, 'failed': 0, 'cache_size_mb': 0.0}
                     else:
                         print(f"✅ DataManager inicializado: {workspace_dir}")
-                    
-                    # SIEMPRE cargar farms_metadata (es ligero, solo IDs)
-                    # Esto incluye farm_polygon_id para evitar consultas duplicadas a MongoDB
-                    if farm_limit:
-                        print(f"⚠ MODO TESTING: Limitando a {farm_limit:,} farms")
-                    
-                    farms_metadata, db_error = data_manager.load_farms_metadata(
-                        limit=farm_limit, 
-                        offline_mode=offline_mode,
-                        value_chain=args.value_chain
-                    )
-                    
-                    # Si hay error de BD, advertir pero continuar
-                    if db_error:
-                        print(f"\n⚠ ERROR DE BASE DE DATOS: {db_error}")
-                        if needs_geometries:
-                            print(f"📂 Intentando modo fallback: usar geojsons existentes en carpeta\n")
-                        farms_metadata = None  # Señal para usar fallback
-                        geom_stats = {'loaded': 0, 'failed': 0, 'cache_size_mb': 0.0}
-                    
-                    # Solo cargar geojsons/geometrías si se necesitan (pasos 1 o 3)
-                    if needs_geometries and farms_metadata:
-                        # Preparar geojsons para los farms cargados
-                        if offline_mode:
-                            # Modo offline: solo contar geojsons existentes, no descargar
-                            geojsons_available = data_manager.count_available_geojsons(farms_metadata)
+                        
+                        # SIEMPRE cargar farms_metadata (es ligero, solo IDs)
+                        # Esto incluye farm_polygon_id para evitar consultas duplicadas a MongoDB
+                        if farm_limit:
+                            print(f"⚠ MODO TESTING: Limitando a {farm_limit:,} farms")
+                        
+                        farms_metadata, db_error = data_manager.load_farms_metadata(
+                            limit=farm_limit,
+                            offline_mode=False,
+                            value_chain=args.value_chain,
+                            refresh_data=args.refresh_data
+                        )
+                        
+                        # Si hay error de BD, advertir pero continuar
+                        if db_error:
+                            print(f"\n⚠ ERROR DE BASE DE DATOS: {db_error}")
+                            if needs_geometries:
+                                print(f"📂 Intentando modo fallback: usar geojsons existentes en carpeta\n")
+                            farms_metadata = None  # Señal para usar fallback
+                            geom_stats = {'loaded': 0, 'failed': 0, 'cache_size_mb': 0.0}
+                        
+                        # Solo cargar geojsons/geometrías si se necesitan (pasos 1 o 3)
+                        if needs_geometries and farms_metadata:
+                            # Preparar geojsons para los farms cargados
+                            geojsons_available = data_manager.prepare_geojsons(
+                                farms_metadata,
+                                force_download=args.refresh_data
+                            )
+                            
+                            if geojsons_available == 0:
+                                print(f"⚠ Warning: No hay geojsons disponibles para procesar")
+                            
+                            # 🚀 OPTIMIZACIÓN: Cargar geometrías en memoria
+                            print("\n" + "="*70)
+                            print("🚀 Optimizaciones de Performance")
+                            print("="*70)
+                            geom_stats = data_manager.load_geometries_to_cache(farms_metadata)
+                            
+                            # 🚀 OPTIMIZACIÓN: Construir índice espacial
+                            if geom_stats['loaded'] > 0:
+                                try:
+                                    index_stats = data_manager.build_spatial_index()
+                                except Exception as idx_err:
+                                    print(f"⚠ No se pudo construir índice espacial (no es crítico): {idx_err}")
+                                    index_stats = {'indexed': 0, 'build_time': 0.0}
+                                print(f"\n💾 Memoria total usada: ~{geom_stats['cache_size_mb']:.1f} MB")
+                        elif not needs_geometries:
+                            # No se necesitan geometrías para estos pasos
+                            print(f"⏭️ Omitiendo carga de geometrías (no requeridas para pasos seleccionados)")
+                            geom_stats = {'loaded': 0, 'failed': 0, 'cache_size_mb': 0.0}
                         else:
-                            geojsons_available = data_manager.prepare_geojsons(farms_metadata)
+                            geom_stats = {'loaded': 0, 'failed': 0, 'cache_size_mb': 0.0}
                         
-                        if geojsons_available == 0:
-                            print(f"⚠ Warning: No hay geojsons disponibles para procesar")
-                        
-                        # 🚀 OPTIMIZACIÓN: Cargar geometrías en memoria
-                        print("\n" + "="*70)
-                        print("🚀 Optimizaciones de Performance")
-                        print("="*70)
-                        geom_stats = data_manager.load_geometries_to_cache(farms_metadata)
-                        
-                        # 🚀 OPTIMIZACIÓN: Construir índice espacial
-                        if geom_stats['loaded'] > 0:
-                            try:
-                                index_stats = data_manager.build_spatial_index()
-                            except Exception as idx_err:
-                                print(f"⚠ No se pudo construir índice espacial (no es crítico): {idx_err}")
-                                index_stats = {'indexed': 0, 'build_time': 0.0}
-                            print(f"\n💾 Memoria total usada: ~{geom_stats['cache_size_mb']:.1f} MB")
-                    elif not needs_geometries:
-                        # No se necesitan geometrías para estos pasos
-                        print(f"⏭️ Omitiendo carga de geometrías (no requeridas para pasos seleccionados)")
-                        geom_stats = {'loaded': 0, 'failed': 0, 'cache_size_mb': 0.0}
-                    else:
-                        geom_stats = {'loaded': 0, 'failed': 0, 'cache_size_mb': 0.0}
-                    
-                    # Preparar geojsons directory
-                    geojsons_folder = str(data_manager.geojsons_dir)
+                        # Preparar geojsons directory
+                        geojsons_folder = str(data_manager.geojsons_dir)
                 else:
-                    print(f"⚠ WORKSPACE_DIR o GEOSERVER_URL no configurados")
+                    print(f"⚠ WORKSPACE_DIR no configurado")
             except Exception as e:
                 print(f"⚠ Error inicializando DataManager: {e}")
                 data_manager = None
@@ -1394,13 +1412,17 @@ Ejemplos de uso:
         # Preparar rutas de salida
         if data_manager:
             # Usar directorios gestionados por DataManager
-            output_base = str(data_manager.get_results_dir('direct_alerts'))
+            output_base = str(data_manager.get_results_dir(
+                'direct_alerts', source=args.source, deforestation_type=args.period_type
+            ))
             output_csv = f"{output_base}/direct_alert_{{PERIODO}}_{{YEARS}}.csv"
             farm_folder = str(data_manager.geojsons_dir)
+            raster_template = ''
         else:
             # Fallback a config.py legacy
             output_csv = config.get('OUTPUT_CSV', '')
             farm_folder = config.get('FOLDER_GEOJSONS', '')
+            raster_template = config.get('RASTER_DEFOREST', '')
         
         # Preparar parámetros para direct_alert usando función directa
         direct_params = {
@@ -1408,9 +1430,9 @@ Ejemplos de uso:
             'period_type': args.period_type,
             'years': periods,  # lista de períodos
             'farm_folder': farm_folder,
-            'raster_template': '',  # Se llenará dinámicamente por período
+            'raster_template': raster_template,
             'output_csv': output_csv,
-            'batch_size': config.get('BATCH_SIZE', 1000),
+            'batch_size': config.get('BATCH_SIZE', 10000),
             'farm_range': config.get('FARM_FILE_RANGE', ''),
             'crs': config.get('CRS_METROS', 'EPSG:3116'),
             'deforest_value': config.get('DEFOREST_VALUE', 2),
@@ -1492,7 +1514,11 @@ Ejemplos de uso:
             data_manager=data_manager,
             farms_metadata=farms_metadata,
             periods=periods,
-            workspace_dir=workspace_path
+            workspace_dir=workspace_path,
+            offline_mode=offline_mode,
+            geojsons_folder=geojsons_folder,
+            source=args.source,
+            period_type=args.period_type,
         )
         print_validation_summary(stage, is_valid, error_msg)
         

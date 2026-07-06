@@ -39,10 +39,10 @@ config['PERIODO'] = os.getenv("PERIODO", "")  # Opcional, se pasa desde main.py
 config['BATCH_SIZE'] = int(os.getenv("BATCH_SIZE", "1000"))
 
 # --- Geoserver (nuevo) ---
-config['GEOSERVER_URL'] = os.getenv("GEOSERVER_URL", "")
-config['GEOSERVER_USER'] = os.getenv("GEOSERVER_USER", "admin")
-config['GEOSERVER_PASS'] = os.getenv("GEOSERVER_PASS", "geoserver")
-config['WORKSPACE_DIR'] = os.getenv("WORKSPACE_DIR", "./workspace")
+config['GEOSERVER_URL'] = os.getenv("URL_GEO", "http://localhost:8600/geoserver")
+config['GEOSERVER_USER'] = os.getenv("GEO_USER", "admin")
+config['GEOSERVER_PASS'] = os.getenv("GEO_PWD", "geoserver")
+config['WORKSPACE_DIR'] = os.getenv("WORKSPACE", "./workspace")
 
 # --- Rutas (opcionales ahora, se manejan con DataManager) ---
 config['FOLDER_GEOJSONS'] = os.getenv("FOLDER_GEOJSONS", "")
@@ -55,7 +55,7 @@ config['FARMING_FRONTIER_SHP'] = os.getenv("FARMING_FRONTIER_SHP", "")
 
 # Logging (opcionales)
 config['LOG_LEVEL'] = os.getenv("LOG_LEVEL", "WARNING")
-config['LOG_FILE']  = os.getenv("LOG_FILE",  "risk_analysis_intersections.log")
+config['LOG_FILE']  = os.getenv("LOG_FILE",  "risk_analysis.log")
 
 # --- Movement (opcionales) ---
 config['DIRECT_RISK_CSV'] = os.getenv("DIRECT_RISK_CSV", "")

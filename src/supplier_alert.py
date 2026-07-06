@@ -3,7 +3,7 @@
 """
 Cálculo de riesgo de empresa basado en Suppliers (relación empresa-fincas).
 
-A diferencia del enterprise_alert_calculator (que usa movimientos de ganado),
+A diferencia del enterprise_alert (que usa movimientos de ganado),
 este módulo calcula el riesgo de empresas que NO tienen movimientos, pero
 SÍ tienen relación con fincas a través de la colección Suppliers.
 

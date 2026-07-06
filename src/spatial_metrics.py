@@ -11,20 +11,22 @@ Con descarga automática desde geoserver si no existe caché local.
 """
 
 import os
+import re
+import sys
 import time
 import logging
 import zipfile
 import tempfile
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import requests
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry.base import BaseGeometry
 from tqdm import tqdm
 
 from config import config
+from utils import setup_logging, normalize_farm_id
 from ganabosques_risk_package.spatial_metrics import spatial_metrics as pkg_spatial_metrics
 
 # URLs de geoserver (sin maxFeatures para descargar todo)
@@ -41,21 +43,6 @@ PNN_WFS_URL = (
     "&typeName=administrative:pnn_areas"
     "&outputFormat=SHAPE-ZIP"
 )
-
-
-def setup_logging():
-    """Configura logging para métricas espaciales."""
-    lvl = getattr(logging, str(config.get("LOG_LEVEL", "WARNING")).upper(), logging.WARNING)
-    logging.basicConfig(
-        level=lvl,
-        format="%(asctime)s %(levelname)s:%(message)s"
-    )
-
-
-def area_ha(geom: BaseGeometry) -> float:
-    """Calcula área de geometría en hectáreas."""
-    return float(geom.area / 10_000.0)
-
 
 def download_and_extract_wfs(url: str, output_dir: Path, layer_name: str, expected_crs: str) -> Optional[Path]:
     """
@@ -151,58 +138,6 @@ def download_and_extract_wfs(url: str, output_dir: Path, layer_name: str, expect
         return None
 
 
-def compute_intersection_area_ha_via_sindex(farm_geom: BaseGeometry, mask_gdf: gpd.GeoDataFrame) -> float:
-    """
-    Calcula área de intersección usando spatial index para eficiencia.
-    
-    Args:
-        farm_geom: Geometría del farm
-        mask_gdf: GeoDataFrame con polígonos de referencia (Frontera/PNN)
-        
-    Returns:
-        Área de intersección en hectáreas
-    """
-    if mask_gdf is None or mask_gdf.empty:
-        return 0.0
-    
-    try:
-        sidx = mask_gdf.sindex
-    except Exception:
-        sidx = None
-    
-    # Filtrar candidatos usando bounds
-    cand_idx = list(sidx.intersection(farm_geom.bounds)) if sidx is not None else list(range(len(mask_gdf)))
-    if not cand_idx:
-        return 0.0
-    
-    mask_sub = mask_gdf.iloc[cand_idx]
-    mask_sub = mask_sub[mask_sub.intersects(farm_geom)]
-    
-    if mask_sub.empty:
-        return 0.0
-    
-    # Calcular intersección acumulada
-    covered = None
-    for mg in mask_sub.geometry:
-        try:
-            inter = farm_geom.intersection(mg)
-        except Exception:
-            try:
-                inter = farm_geom.buffer(0).intersection(mg.buffer(0))
-            except Exception:
-                continue
-        
-        if inter.is_empty:
-            continue
-        
-        covered = inter if covered is None else covered.union(inter)
-    
-    if covered is None or covered.is_empty:
-        return 0.0
-    
-    return area_ha(covered)
-
-
 def load_reference_layer(path: str, expected_crs: str, label: str) -> Optional[gpd.GeoDataFrame]:
     """
     Carga capa de referencia (Frontera/PNN) y verifica CRS.
@@ -294,14 +229,20 @@ def load_or_download_reference_layer(
         return None
 
 
-def load_farm_geometries(farms_metadata: List[Dict], data_manager, expected_crs: str) -> gpd.GeoDataFrame:
+def load_farm_geometries(
+    farms_metadata: Optional[List[Dict]],
+    data_manager,
+    expected_crs: str,
+    farm_limit: Optional[int] = None
+) -> gpd.GeoDataFrame:
     """
     Carga geometrías de farms desde caché de DataManager (preferido) o desde disco.
     
     Args:
-        farms_metadata: Lista de dicts con metadata de farms
+        farms_metadata: Lista de dicts con metadata de farms (puede ser None en modo offline)
         data_manager: Instancia de DataManager
         expected_crs: CRS esperado
+        farm_limit: Límite opcional de farms a procesar
         
     Returns:
         GeoDataFrame con geometrías de farms
@@ -312,6 +253,8 @@ def load_farm_geometries(farms_metadata: List[Dict], data_manager, expected_crs:
         t0 = time.perf_counter()
         
         farms_gdf = data_manager.get_farms_geodataframe(expected_crs)
+        farms_gdf['id'] = farms_gdf['id'].map(normalize_farm_id)
+        farms_gdf = farms_gdf[farms_gdf['id'] != ""]
         
         # Disolver por ID (por si hay múltiples polígonos)
         farms_gdf = farms_gdf.dissolve(by='id', as_index=False)
@@ -319,24 +262,39 @@ def load_farm_geometries(farms_metadata: List[Dict], data_manager, expected_crs:
         print(f"✅ Farms desde caché: {len(farms_gdf):,} en {time.perf_counter() - t0:.2f}s")
         return farms_gdf
     
-    # Fallback: leer desde disco (método original)
-    print(f"📂 Cargando geometrías de {len(farms_metadata):,} farms desde disco...")
+    # Fallback: leer desde disco
     t0 = time.perf_counter()
     
     frames = []
     failed = 0
     
-    for farm in tqdm(farms_metadata, desc="Cargando farms", unit="farm"):
-        sitcode = farm.get('sitcode')
-        if not sitcode:
-            failed += 1
-            continue
-        
-        geojson_path = data_manager.geojsons_dir / f"{sitcode}.geojson"
-        
-        if not geojson_path.exists():
-            failed += 1
-            continue
+    # Si no hay metadata (modo offline), usar todos los geojsons de carpeta.
+    if farms_metadata:
+        print(f"📂 Cargando geometrías de {len(farms_metadata):,} farms desde disco...")
+        geojson_items = []
+        for farm in farms_metadata:
+            sitcode = farm.get('sitcode')
+            if not sitcode:
+                failed += 1
+                continue
+            normalized_id = normalize_farm_id(sitcode)
+            if not normalized_id:
+                failed += 1
+                continue
+            geojson_path = data_manager.geojsons_dir / f"{sitcode}.geojson"
+            if not geojson_path.exists():
+                failed += 1
+                continue
+            geojson_items.append((normalized_id, geojson_path))
+    else:
+        geojson_paths = sorted(data_manager.geojsons_dir.glob("*.geojson"))
+        if farm_limit and farm_limit > 0:
+            geojson_paths = geojson_paths[:farm_limit]
+        print(f"📂 Modo offline: cargando {len(geojson_paths):,} GeoJSONs desde {data_manager.geojsons_dir}...")
+        geojson_items = [(normalize_farm_id(p.stem), p) for p in geojson_paths]
+        geojson_items = [(farm_id, path) for farm_id, path in geojson_items if farm_id]
+
+    for farm_id, geojson_path in tqdm(geojson_items, desc="Cargando farms", unit="farm"):
         
         try:
             gdf = gpd.read_file(geojson_path)
@@ -353,11 +311,11 @@ def load_farm_geometries(farms_metadata: List[Dict], data_manager, expected_crs:
             
             # Agregar ID
             gdf_farm = gdf[['geometry']].copy()
-            gdf_farm['id'] = sitcode
+            gdf_farm['id'] = farm_id
             frames.append(gdf_farm)
             
         except Exception as e:
-            logging.warning(f"Error cargando {sitcode}: {e}")
+            logging.warning(f"Error cargando {farm_id}: {e}")
             failed += 1
     
     if not frames:
@@ -373,88 +331,26 @@ def load_farm_geometries(farms_metadata: List[Dict], data_manager, expected_crs:
     return farms_gdf
 
 
-def compute_metrics_for_farms(
-    farms_gdf: gpd.GeoDataFrame,
-    frontier_gdf: Optional[gpd.GeoDataFrame],
-    protected_gdf: Optional[gpd.GeoDataFrame]
-) -> pd.DataFrame:
-    """
-    Calcula métricas espaciales para cada farm.
-    
-    Args:
-        farms_gdf: GeoDataFrame con farms
-        frontier_gdf: GeoDataFrame con frontera agrícola
-        protected_gdf: GeoDataFrame con áreas protegidas
-        
-    Returns:
-        DataFrame con métricas por farm
-    """
-    print(f"\n📊 Calculando métricas espaciales para {len(farms_gdf):,} farms...")
-    t0 = time.perf_counter()
-    
-    rows = []
-    
-    for _, farm_row in tqdm(farms_gdf.iterrows(), total=len(farms_gdf), desc="Procesando", unit="farm"):
-        farm_id = farm_row['id']
-        geom = farm_row.geometry
-        
-        # Área total
-        total_ha = area_ha(geom)
-        
-        # Intersección con Frontera Agrícola
-        if frontier_gdf is not None:
-            farming_in_ha = compute_intersection_area_ha_via_sindex(geom, frontier_gdf)
-        else:
-            farming_in_ha = 0.0
-        
-        # Área fuera de frontera (resto)
-        farming_out_ha = max(total_ha - farming_in_ha, 0.0)
-        
-        # Intersección con Áreas Protegidas
-        if protected_gdf is not None:
-            protected_ha = compute_intersection_area_ha_via_sindex(geom, protected_gdf)
-        else:
-            protected_ha = 0.0
-        
-        # Proporciones
-        farming_in_prop = farming_in_ha / total_ha if total_ha > 0 else 0.0
-        farming_out_prop = farming_out_ha / total_ha if total_ha > 0 else 0.0
-        protected_prop = protected_ha / total_ha if total_ha > 0 else 0.0
-        
-        rows.append({
-            'id': farm_id,
-            'total_ha': round(total_ha, 4),
-            'farming_in_ha': round(farming_in_ha, 4),
-            'farming_in_prop': round(farming_in_prop, 6),
-            'farming_out_ha': round(farming_out_ha, 4),
-            'farming_out_prop': round(farming_out_prop, 6),
-            'protected_ha': round(protected_ha, 4),
-            'protected_prop': round(protected_prop, 6)
-        })
-    
-    print(f"✅ Métricas calculadas en {time.perf_counter() - t0:.2f}s")
-    
-    return pd.DataFrame(rows)
-
-
 def calculate_spatial_metrics(
-    farms_metadata: List[Dict],
+    farms_metadata: Optional[List[Dict]],
     data_manager,
     output_dir: Optional[str] = None,
     output_name: str = "spatial_metrics.csv",
     use_parallel: bool = False,
-    num_workers: Optional[int] = None
+    num_workers: Optional[int] = None,
+    farm_limit: Optional[int] = None
 ) -> Dict[str, Any]:
     """
     Pipeline completo de cálculo de métricas espaciales.
     
     Args:
-        farms_metadata: Lista de metadata de farms
+        farms_metadata: Lista de metadata de farms (puede ser None en modo offline)
         data_manager: Instancia de DataManager
         output_dir: Directorio de salida (default: workspace/metrics)
         output_name: Nombre del archivo CSV de salida
         use_parallel: Si True, usa procesamiento paralelo
         num_workers: Número de workers para modo paralelo (None = auto)
+        farm_limit: Límite opcional de farms a procesar
         
     Returns:
         Dict con estadísticas de ejecución
@@ -513,9 +409,12 @@ def calculate_spatial_metrics(
         
         metrics_df = parallel_result['results_df']
     else:
-        # Modo secuencial → usa ganabosques_risk_package.spatial_metrics
-        # 2) Cargar geometrías de farms como GeoDataFrame
-        farms_gdf = load_farm_geometries(farms_metadata, data_manager, crs)
+        farms_gdf = load_farm_geometries(
+            farms_metadata=farms_metadata,
+            data_manager=data_manager,
+            expected_crs=crs,
+            farm_limit=farm_limit
+        )
         
         # 3) Calcular métricas con el paquete reutilizable
         metrics_df = pkg_spatial_metrics(
@@ -575,9 +474,9 @@ def calculate_spatial_metrics(
 def main():
     """Función principal para ejecución standalone."""
     from data_manager import DataManager
+    from parallel_processor import run_parallel_spatial_metrics
     
     # Obtener farm_limit de variables de entorno (si existe)
-    import sys
     farm_limit = None
     if '--farm-limit' in sys.argv:
         idx = sys.argv.index('--farm-limit')

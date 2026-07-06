@@ -7,10 +7,9 @@ facilitando la revisión y corrección posterior.
 """
 
 import csv
-import os
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, Dict
 from threading import Lock
 
 
@@ -211,10 +210,6 @@ class ErrorLogger:
     def print_summary(self):
         """Imprime resumen de errores."""
         summary = self.get_summary()
-        
-        if summary['total_errors'] == 0:
-            print("No se registraron errores")
-            return
         
         print(f"\n⚠ RESUMEN DE ERRORES ({summary['total_errors']} total)")
         print("=" * 50)

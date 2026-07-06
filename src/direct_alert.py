@@ -12,13 +12,12 @@ from rasterio.crs import CRS as RCRS
 from rasterio.vrt import WarpedVRT
 from shapely.geometry import mapping
 from shapely.ops import unary_union, transform as shapely_transform
-from shapely.validation import make_valid
 from pyproj import Transformer
 from tqdm import tqdm
 from rasterio.features import shapes
 from shapely.geometry import shape
-from shapely.ops import unary_union
 from ganabosques_risk_package.alert_direct import alert_direct as pkg_alert_direct
+from utils import parse_year_periods, area_ha, setup_logging
 
 # ===================== AJUSTES =====================
 SETTINGS: Dict[str, Any] = {
@@ -44,29 +43,6 @@ SETTINGS: Dict[str, Any] = {
 # ===================== utilidades básicas =====================
 def norm(p: str) -> str:
     return os.path.normpath(p.replace("\\", "/")) if p else p
-
-def setup_logging():
-    lvl = getattr(logging, SETTINGS['LOG_LEVEL'].upper(), logging.WARNING)
-    root = logging.getLogger()
-    for h in list(root.handlers):
-        root.removeHandler(h)
-    logging.basicConfig(filename=SETTINGS['LOG_FILE'], level=lvl, format="%(asctime)s %(levelname)s:%(message)s")
-    console = logging.StreamHandler()
-    console.setLevel(lvl)
-    console.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    root.addHandler(console)
-
-def parse_year_periods(years_raw: str) -> List[str]:
-    if not years_raw:
-        return []
-    parts = [p.strip() for p in years_raw.split(",") if p.strip()]
-    valids = []
-    for p in parts:
-        if re.match(r"^\d{4}\s*-\s*\d{4}$", p):
-            valids.append(p.replace(" ", ""))
-        else:
-            logging.warning(f"YEARS ignorado por formato no válido: '{p}' (usa AAAA-AAAA)")
-    return valids
 
 def format_placeholders(template: Optional[str], ctx: Dict[str, Any]) -> Optional[str]:
     if not template:
@@ -156,16 +132,6 @@ def _is_vector(path: str) -> bool:
 def _is_raster(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in RASTER_EXTS
 
-# ===================== Área en hectáreas en CRS proyectado (3116) =====================
-def area_hectares_from_3116(geom) -> float:
-    """
-    Calcula área (hectáreas) de un Polygon/MultiPolygon en un CRS proyectado en metros
-    (por defecto EPSG:3116). Se asume que la geometría YA está en ese CRS.
-    """
-    if geom is None or geom.is_empty:
-        return 0.0
-    return float(geom.area) / 10000.0
-
 # ===================== Cargar vectores (asegurando 3116) =====================
 def load_vector_from_paths(paths: List[str], expected_crs: str) -> Optional[gpd.GeoDataFrame]:
     geoms = []
@@ -249,13 +215,6 @@ def open_rasters(paths: List[str], target_crs="EPSG:3116"):
             logging.warning(f"No se pudo abrir raster {p}: {e}")
     return srcs
 
-def close_rasters(srcs):
-    for s in srcs or []:
-        try:
-            s.close()
-        except Exception:
-            pass
-
 # ===================== Util: área aproximada por píxel cuando raster está en 4326 =====================
 def pixel_area_m2_approx_for_vrt(src):
     """
@@ -294,7 +253,7 @@ def area_from_vectors(geom, gdf_opt: Optional[gpd.GeoDataFrame]) -> float:
             return 0.0
         inter_union = unary_union(inters.to_list())
         # área en hectáreas en 3116
-        return float(area_hectares_from_3116(inter_union))
+        return float(area_ha(inter_union))
     except Exception as e:
         logging.warning(f"Error área vectorial: {e}")
         return 0.0
@@ -379,47 +338,13 @@ def calculate_deforestation_metrics_from_src(src, geom, deforest_value, use_prec
             area_m2 = intersection.area
             defo_ha = area_m2 / 10000.0
 
-            """ elif use_precise_area:
-                # 🎯 MÉTODO PRECISO: Super-sampling con fracciones de píxel
-                # Crear grilla de alta resolución para calcular cobertura fraccionaria
-                height, width = arr.shape
-                supersample_shape = (height * supersample_factor, width * supersample_factor)
-                
-                # Ajustar transform para la grilla fina
-                from rasterio.transform import Affine
-                super_transform = Affine(
-                    out_transform.a / supersample_factor,
-                    out_transform.b,
-                    out_transform.c,
-                    out_transform.d,
-                    out_transform.e / supersample_factor,
-                    out_transform.f
-                )
-                
-                # Rasterizar geometría en grilla fina
-                super_coverage = rasterize(
-                    [(geom_for_mask, 1)],
-                    out_shape=supersample_shape,
-                    transform=super_transform,
-                    all_touched=True,
-                    dtype='uint8',
-                    fill=0
-                )
-                
-                # Reducir a resolución original contando sub-píxeles
-                reshaped = super_coverage.reshape(height, supersample_factor, width, supersample_factor)
-                coverage_fraction = reshaped.sum(axis=(1, 3)) / (supersample_factor * supersample_factor)
-                
-                # Calcular área usando fracciones
-                fractional_count = float(np.sum(coverage_fraction[m]))
-                defo_ha = fractional_count * pixel_area / 10_000.0 """
         
         else:
             # ⚡ MÉTODO RÁPIDO: Contar píxeles completos (método actual)
             defo_ha = cnt * pixel_area / 10_000.0
 
         # área de la geometría en hectáreas (CRS_METROS = 3116)
-        geom_ha = area_hectares_from_3116(geom)
+        geom_ha = area_ha(geom)
         if geom_ha <= 0:
             prop = 0.0
         else:
@@ -476,72 +401,6 @@ def process_row_option1(row, raster_src, deforest_value: int, use_precise_area: 
         "direct_alert": bool(inter_def),
     }
 
-def process_row_option2(row, alerts_vec, alerts_src_list, crs_expected):
-    farm_id = row["farm_id"]; geom = row["geometry"]
-    total_ha_geom = float(area_hectares_from_3116(geom))
-    has_data = (alerts_vec is not None and not alerts_vec.empty) or (alerts_src_list and len(alerts_src_list) > 0)
-    if not has_data:
-        nan = float("nan")
-        return {
-            "id": farm_id,
-            "intersect_early_warnings": nan,
-            "early_warnings_ha": nan,
-            "early_warnings_prop": nan,
-            "direct_alert": False,
-        }, False
-    ha_vec = area_from_vectors(geom, alerts_vec)
-    ha_ras = area_from_rasters_open(geom, alerts_src_list)
-    ha = ha_vec + ha_ras
-    if ha <= 0.0 or total_ha_geom <= 0.0:
-        return {
-            "id": farm_id,
-            "intersect_early_warnings": True,
-            "early_warnings_ha": 0.0,
-            "early_warnings_prop": 0.0,
-            "direct_alert": False,
-        }, True
-    prop = ha / total_ha_geom
-    return {
-        "id": farm_id,
-        "intersect_early_warnings": True,
-        "early_warnings_ha": round(float(ha), 4),
-        "early_warnings_prop": round(float(prop), 6),
-        "direct_alert": True,
-    }, True
-
-def process_row_option3(row, nucleos_vec, nucleos_src_list, crs_expected):
-    farm_id = row["farm_id"]; geom = row["geometry"]
-    total_ha_geom = float(area_hectares_from_3116(geom))
-    has_data = (nucleos_vec is not None and not nucleos_vec.empty) or (nucleos_src_list and len(nucleos_src_list) > 0)
-    if not has_data:
-        nan = float("nan")
-        return {
-            "id": farm_id,
-            "intersect_active_hotspots": nan,
-            "active_hotspots_ha": nan,
-            "active_hotspots_prop": nan,
-            "direct_alert": False,
-        }, False
-    ha_vec = area_from_vectors(geom, nucleos_vec)
-    ha_ras = area_from_rasters_open(geom, nucleos_src_list)
-    ha = ha_vec + ha_ras
-    if ha <= 0.0 or total_ha_geom <= 0.0:
-        return {
-            "id": farm_id,
-            "intersect_active_hotspots": True,
-            "active_hotspots_ha": 0.0,
-            "active_hotspots_prop": 0.0,
-            "direct_alert": False,
-        }, True
-    prop = ha / total_ha_geom
-    return {
-        "id": farm_id,
-        "intersect_active_hotspots": True,
-        "active_hotspots_ha": round(float(ha), 4),
-        "active_hotspots_prop": round(float(prop), 6),
-        "direct_alert": True,
-    }, True
-
 def print_availability_option(name: str, found: bool, details: str = ""):
     yn = "Sí" if found else "No"
     print(f"  • {name}: {yn} {details}")
@@ -575,8 +434,15 @@ def make_out_dir_and_paths(base_output_template: str, ctx: Dict[str,str], source
     
     # Si se proporciona deforestation_type, usar nueva estructura
     if deforestation_type:
-        # Estructura: results/{source}/{deforestation_type}/direct_alerts/
-        out_dir = norm(os.path.join(results_parent, source_tag.lower(), deforestation_type.lower(), "direct_alerts"))
+        # Si base_dir ya está en la estructura nueva, no re-agregar source/type
+        normalized_parts = [p.lower() for p in norm(base_dir).replace("\\", "/").split("/") if p]
+        expected_tail = [source_tag.lower(), deforestation_type.lower(), "direct_alerts"]
+
+        if len(normalized_parts) >= 3 and normalized_parts[-3:] == expected_tail:
+            out_dir = norm(base_dir)
+        else:
+            # Estructura: results/{source}/{deforestation_type}/direct_alerts/
+            out_dir = norm(os.path.join(results_parent, source_tag.lower(), deforestation_type.lower(), "direct_alerts"))
     else:
         # Fallback a estructura anterior para compatibilidad
         option_map = {"smbyc": "SMBYC", "atd": "ATD", "nad": "NAD", "otra": "OTRA"}
@@ -601,7 +467,7 @@ def calculate_direct_alerts(
     farm_folder: str,
     raster_template: str,
     output_csv: str,
-    batch_size: int = 1000,
+    batch_size: int = 10000,
     farm_range: str = "",
     crs: str = "EPSG:3116",
     deforest_value: int = 2,
@@ -612,7 +478,9 @@ def calculate_direct_alerts(
     pixel_divisions: int = 5,
     _data_manager: Optional[Any] = None,
     _farms_metadata: Optional[List[Dict]] = None,
-    _farm_limit: Optional[int] = None
+    _farm_limit: Optional[int] = None,
+    _farm_range_filter: Optional[set] = None,
+    _farm_files_subset: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Calcula alertas directas de deforestación para predios ganaderos.
@@ -633,6 +501,8 @@ def calculate_direct_alerts(
         raster_paths_dict: Diccionario {period_name: raster_path} con rutas preparadas (opcional)
         use_precise_area: Si True, usa super-sampling para cálculo preciso de fracciones de píxel
         pixel_divisions: Divisiones por píxel para super-sampling (default 5 = 5×5 = 25 sub-píxeles)
+        _farm_range_filter: (Interno) Conjunto de nombres de archivo para filtrar solo los del worker
+        _farm_files_subset: (Interno) Lista explícita de archivos a procesar en paralelo
         
     Returns:
         Dict con estadísticas: {
@@ -652,6 +522,10 @@ def calculate_direct_alerts(
     console.setLevel(lvl)
     console.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
     root.addHandler(console)
+
+    # Evitar ruido de warnings no críticos de drivers OGR al leer atributos no soportados.
+    logging.getLogger("pyogrio").setLevel(logging.ERROR)
+    logging.getLogger("fiona").setLevel(logging.ERROR)
 
     # Mapear source a tag y deforest_value
     if source.lower() == "smbyc":
@@ -739,7 +613,12 @@ def calculate_direct_alerts(
     else:
         # Modo fallback: usar geojsons de carpeta (cuando falla BD o no hay farms)
         print(f"📂 Modo fallback: buscando geojsons en carpeta...")
-        all_files = sorted([f for f in os.listdir(folder_geojsons) if f.lower().endswith(".geojson")])
+        if _farm_files_subset is not None:
+            all_files = sorted([f for f in _farm_files_subset if str(f).lower().endswith(".geojson")])
+            print(f"📦 GeoJSONs del chunk recibidos: {len(all_files):,}")
+        else:
+            all_files = sorted([f for f in os.listdir(folder_geojsons) if f.lower().endswith(".geojson")])
+            print(f"📦 GeoJSONs encontrados: {len(all_files):,} en {folder_geojsons}")
         
         if not all_files:
             raise RuntimeError(
@@ -748,8 +627,6 @@ def calculate_direct_alerts(
                 f"   • No hay geojsons en: {folder_geojsons}\n"
                 f"   → Solución: Verifica la conexión a MongoDB o coloca geojsons en la carpeta"
             )
-        
-        print(f"📦 GeoJSONs encontrados: {len(all_files):,} en {folder_geojsons}")
         
         # Aplicar límite si se especificó
         if _farm_limit and _farm_limit > 0:
@@ -771,6 +648,11 @@ def calculate_direct_alerts(
                 print(f"⚠ farm_limit recibido pero no aplicado: {_farm_limit} (verif icar lógica)")
             print(f"✅ Se procesarán todos los geojsons disponibles")
         
+        # Aplicar filtro de rango para workers paralelos si se especificó
+        if _farm_range_filter:
+            files = [f for f in files if f in _farm_range_filter]
+            print(f"🔀 Filtro de worker aplicado: {len(files):,} geojsons de este worker")
+        
         print(f"⚙ BATCH_SIZE={batch_size}")
         total_files_initial = len(all_files)
         total_files = len(files)
@@ -779,112 +661,106 @@ def calculate_direct_alerts(
     print(f"🏁 Se procesarán {total_files} archivos en {total_batches} lotes (batch_size={batch_size}).")
 
     start_all = time.time()
-    # ===================== LOOP POR YEARS =====================
-    periods_progress = tqdm(
-        enumerate(years_list, start=1),
-        total=len(years_list),
-        desc="📅 Períodos",
-        unit="período",
-        position=0,
-        leave=True
-    )
-    for p_idx, years in periods_progress:
-        periods_progress.set_description(f"📅 Procesando {years}")
+    # Preparar períodos válidos una sola vez (raster + archivo de salida)
+    period_contexts: List[Dict[str, Any]] = []
+    skipped_periods: List[str] = []
+
+    for years in years_list:
         ctx = {"PERIODO": periodo, "YEARS": years}
 
-        # --- Cargar raster de deforestación para este período
-        # Usar ruta preparada si está disponible, sino usar template
         if raster_paths_dict and years in raster_paths_dict:
             raster_deforest = raster_paths_dict[years]
             print(f"🔎 Usando raster preparado: {os.path.basename(raster_deforest)}")
         else:
             raster_deforest = norm(format_placeholders(raster_template, ctx))
             print(f"🔎 Validando raster deforestación: {raster_deforest}")
-        
+
         try:
             ensure_raster_crs(raster_deforest, crs)
             raster_src_o1 = open_raster(raster_deforest, target_crs=crs)
-            opt1_available = True
             print_availability_option("Deforestación (raster)", True, f"→ {os.path.basename(raster_deforest)}")
         except Exception as e:
             logging.error(f"[{years}] Error cargando raster: {e}")
             print("❌ No se encontró/validó el raster de deforestación; se omite este periodo.")
-            raster_src_o1 = None
-            opt1_available = False
-
-        # Verificar si hay datos disponibles
-        if not opt1_available:
-            print("⚠ No hay raster disponible para este periodo. Se omite generación de resultados.")
-            close_rasters([raster_src_o1] if raster_src_o1 else [])
-            gc.collect()
+            skipped_periods.append(years)
             continue
 
-        # Salida CSV con nueva estructura de carpetas
-        # results/{source}/{deforestation_type}/direct_alerts/{period}/
         _, out_csv_o1 = make_out_dir_and_paths(output_tpl, ctx, opt1_tag, deforestation_type=periodo)
         if os.path.exists(out_csv_o1):
             os.remove(out_csv_o1)
         print(f"🗂️ Salida: {out_csv_o1}")
 
-        # ===================== LOOP POR LOTES =====================
-        start_period = time.time()
-        for b_idx, i in enumerate(range(0, total_files, batch_size), start=1):
-            t_batch = time.time()
-            batch = files[i:i+batch_size]
-            print(f"\n  ➤ Lote {b_idx}/{total_batches} | archivos {i+1}-{i+len(batch)} (de {total_files})")
+        period_contexts.append({
+            "years": years,
+            "raster_deforest": raster_deforest,
+            "out_csv": out_csv_o1,
+            "raster_src": raster_src_o1,
+            "start": time.time(),
+        })
 
-            gdf_list: List[gpd.GeoDataFrame] = []
-            
-            # 🚀 OPTIMIZACIÓN: Usar geometrías desde caché si DataManager está disponible
-            if _data_manager and hasattr(_data_manager, '_geometries_cache') and _data_manager._geometries_cache:
-                for file in batch:
-                    try:
-                        # El archivo se nombró con sitcode (SIT_CODE o GEOFARMER_ID),
-                        # que es la misma clave usada en _geometries_cache.
-                        # Usar el stem del archivo directamente como farm_id.
-                        farm_id = os.path.splitext(file)[0]
-                        
-                        # Obtener geometría desde caché
-                        geom = _data_manager.get_geometry(farm_id)
-                        if geom is None:
-                            logging.warning(f"{file} no tiene geometría en caché; se omite.")
-                            continue
-                        
-                        # Crear GeoDataFrame desde geometría en caché
-                        gdf = gpd.GeoDataFrame({'farm_id': [farm_id], 'geometry': [geom]}, crs=crs)
-                        gdf_list.append(gdf)
-                    except Exception as e:
-                        logging.warning(f"[{years}] Error obteniendo geometría desde caché {file}: {e}")
-            else:
-                # Método tradicional: leer desde archivos
-                for file in batch:
-                    fpath = norm(os.path.join(folder_geojsons, file))
-                    try:
-                        gdf = gpd.read_file(fpath)
-                        # si no tiene CRS o no está en 3116, convertir a 3116
-                        if gdf.crs is None:
-                            logging.warning(f"{file} no tiene CRS; se omite.")
-                            continue
-                        if not _crs_eq(gdf.crs.to_string(), crs):
-                            gdf = gdf.to_crs(crs)
-                        m = re.search(r"(?:[_-])(\d+)\.geojson$", file, re.IGNORECASE) or re.search(r"(\d+)\.geojson$", file, re.IGNORECASE)
-                        farm_id = m.group(1) if m else os.path.splitext(file)[0]
-                        gdf["farm_id"] = farm_id
-                        gdf_list.append(gdf[["farm_id", "geometry"]])
-                    except Exception as e:
-                        logging.warning(f"[{years}] Error leyendo {file}: {e}")
+    if not period_contexts:
+        print("⚠ No hay períodos válidos con raster disponible. Se omite generación de resultados.")
+        return {
+            'periods_processed': 0,
+            'farms_processed': 0,
+            'execution_time': time.time() - start_all,
+            'success': False
+        }
 
-            if not gdf_list:
-                print("    (sin geometrías válidas en este lote)")
-                continue
+    # ===================== LOOP POR LOTES =====================
+    for b_idx, i in enumerate(range(0, total_files, batch_size), start=1):
+        t_batch = time.time()
+        batch = files[i:i+batch_size]
+        print(f"\n  ➤ Lote {b_idx}/{total_batches} | archivos {i+1}-{i+len(batch)} (de {total_files})")
 
-            merged = gpd.GeoDataFrame(pd.concat(gdf_list, ignore_index=True), crs=crs)
+        gdf_list: List[gpd.GeoDataFrame] = []
 
-            # ── Usar ganabosques_risk_package.alert_direct ──
-            merged = merged.rename(columns={"farm_id": "id"})
+        # Cargar geometrías del lote una sola vez para reutilizar en todos los períodos.
+        if _data_manager and hasattr(_data_manager, '_geometries_cache') and _data_manager._geometries_cache:
+            for file in batch:
+                try:
+                    farm_id = os.path.splitext(file)[0]
+                    geom = _data_manager.get_geometry(farm_id)
+                    if geom is None:
+                        logging.warning(f"{file} no tiene geometría en caché; se omite.")
+                        continue
+
+                    gdf = gpd.GeoDataFrame({'farm_id': [farm_id], 'geometry': [geom]}, crs=crs)
+                    gdf_list.append(gdf)
+                except Exception as e:
+                    logging.warning(f"[batch {b_idx}] Error obteniendo geometría desde caché {file}: {e}")
+        else:
+            for file in batch:
+                fpath = norm(os.path.join(folder_geojsons, file))
+                try:
+                    gdf = gpd.read_file(fpath)
+                    if gdf.crs is None:
+                        logging.warning(f"{file} no tiene CRS; se omite.")
+                        continue
+                    if not _crs_eq(gdf.crs.to_string(), crs):
+                        gdf = gdf.to_crs(crs)
+                    stem = os.path.splitext(file)[0]
+                    stem_lower = stem.lower()
+                    farm_id = stem.rsplit("_", 1)[-1] if ("sit" in stem_lower or "farm" in stem_lower) and "_" in stem else stem
+                    gdf["farm_id"] = farm_id
+                    gdf_list.append(gdf[["farm_id", "geometry"]])
+                except Exception as e:
+                    logging.warning(f"[batch {b_idx}] Error leyendo {file}: {e}")
+
+        if not gdf_list:
+            print("    (sin geometrías válidas en este lote)")
+            continue
+
+        merged = gpd.GeoDataFrame(pd.concat(gdf_list, ignore_index=True), crs=crs)
+        merged = merged.rename(columns={"farm_id": "id"})
+
+        for p_idx, pctx in enumerate(period_contexts, start=1):
+            years = pctx["years"]
+            print(f"    ↳ Período {p_idx}/{len(period_contexts)}: {years}")
+
             batch_result = pkg_alert_direct(
                 plots=merged,
-                deforestation_raster=raster_deforest,
+                deforestation_raster=pctx["raster_deforest"],
                 deforestation_value=defo_val,
                 crs=crs,
                 id_column="id",
@@ -892,38 +768,42 @@ def calculate_direct_alerts(
                 show_progress=True,
             )
 
-            # Escritura de resultados (mantener compatibilidad con columnas originales)
             if not batch_result.empty:
                 batch_result["intersect_deforestation"] = batch_result["direct_alert"]
                 out_cols = ["id", "intersect_deforestation", "deforested_ha", "deforested_prop", "direct_alert"]
-                header_needed = not os.path.exists(out_csv_o1)
-                batch_result[out_cols].to_csv(out_csv_o1, mode='a', index=False, header=header_needed)
+                header_needed = not os.path.exists(pctx["out_csv"])
+                batch_result[out_cols].to_csv(pctx["out_csv"], mode='a', index=False, header=header_needed)
 
-            # Limpieza por lote
-            del gdf_list, merged, batch_result
+            del batch_result
             gc.collect()
-            print(f"  ⏱️ Tiempo lote {b_idx}: {time.time()-t_batch:.2f}s")
 
-        # Mensaje final
-        print(f"✅ {opt1_tag.upper()} completado → {out_csv_o1}")
+        del gdf_list, merged
+        gc.collect()
+        print(f"  ⏱️ Tiempo lote {b_idx}: {time.time()-t_batch:.2f}s")
 
-        print(f"⏱ Tiempo periodo {years}: {time.time()-start_period:.2f} s")
+    for pctx in period_contexts:
+        print(f"✅ {opt1_tag.upper()} completado → {pctx['out_csv']}")
+        print(f"⏱ Tiempo periodo {pctx['years']}: {time.time()-pctx['start']:.2f} s")
 
-        # ===================== CIERRE Y LIMPIEZA POR YEARS =====================
+    for pctx in period_contexts:
         try:
-            if raster_src_o1:
-                raster_src_o1.close()
+            if pctx.get("raster_src"):
+                pctx["raster_src"].close()
         except Exception:
             pass
-        gc.collect()
+    gc.collect()
 
-    print(f"\n🎉 Periodos completados: {', '.join(years_list)}")
+    completed_periods = [p["years"] for p in period_contexts]
+    if skipped_periods:
+        print(f"⚠ Períodos omitidos por raster faltante: {', '.join(skipped_periods)}")
+
+    print(f"\n🎉 Periodos completados: {', '.join(completed_periods)}")
     total_time = time.time() - start_all
     print(f"⏱ Tiempo total: {total_time:.2f} s")
     
     # Retornar estadísticas
     return {
-        'periods_processed': len(years_list),
+        'periods_processed': len(period_contexts),
         'farms_processed': total_files,
         'execution_time': total_time,
         'success': True
