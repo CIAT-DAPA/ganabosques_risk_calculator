@@ -10,7 +10,7 @@ from rasterio.mask import mask
 from rasterio.features import rasterize
 from rasterio.crs import CRS as RCRS
 from rasterio.vrt import WarpedVRT
-from shapely.geometry import mapping
+from shapely.geometry import Point, mapping
 from shapely.ops import unary_union, transform as shapely_transform
 from pyproj import Transformer
 from tqdm import tqdm
@@ -42,7 +42,11 @@ SETTINGS: Dict[str, Any] = {
 
 # ===================== utilidades básicas =====================
 def norm(p: str) -> str:
-    return os.path.normpath(p.replace("\\", "/")) if p else p
+    if p is None:
+        return p
+    if isinstance(p, os.PathLike):
+        p = os.fspath(p)
+    return os.path.normpath(str(p).replace("\\", "/")) if p else p
 
 def format_placeholders(template: Optional[str], ctx: Dict[str, Any]) -> Optional[str]:
     if not template:
@@ -135,7 +139,7 @@ def _is_raster(path: str) -> bool:
 # ===================== Cargar vectores (asegurando 3116) =====================
 def load_vector_from_paths(paths: List[str], expected_crs: str) -> Optional[gpd.GeoDataFrame]:
     geoms = []
-    exp = gpd.GeoSeries([0], crs=expected_crs).crs
+    exp = gpd.GeoSeries([Point(0, 0)], crs=expected_crs).crs
     for p in paths:
         try:
             gdf = gpd.read_file(norm(p))

@@ -26,7 +26,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 from tqdm import tqdm
 from ganabosques_risk_package.alert_enterprise import alert_enterprise as pkg_alert_enterprise
-from utils import parse_quarter_from_period
+from utils import parse_quarter_from_period, normalize_farm_id
 
 
 # ===================== CONFIGURACIÓN =====================
@@ -95,7 +95,7 @@ def load_direct_alerts_with_alert(csv_path: str) -> Set[str]:
             return set()
         
         # Filtrar solo los que tienen alerta True
-        df["id_normalized"] = df["id"].apply(normalize_id)
+        df["id_normalized"] = df["id"].apply(normalize_farm_id)
         
         def str_to_bool(x):
             s = str(x).strip().lower()
@@ -150,15 +150,15 @@ def load_movements_for_year(
     
     # Normalizar IDs de farms
     if "origen_id" in df.columns:
-        df["origen_id"] = df["origen_id"].apply(normalize_id)
+        df["origen_id"] = df["origen_id"].apply(normalize_farm_id)
     if "destination_id" in df.columns:
-        df["destination_id"] = df["destination_id"].apply(normalize_id)
+        df["destination_id"] = df["destination_id"].apply(normalize_farm_id)
     
     # Normalizar IDs de productores/empresas
     if "producer_id_origen" in df.columns:
-        df["producer_id_origen"] = df["producer_id_origen"].apply(normalize_id)
+        df["producer_id_origen"] = df["producer_id_origen"].apply(normalize_farm_id)
     if "producer_id_destino" in df.columns:
-        df["producer_id_destino"] = df["producer_id_destino"].apply(normalize_id)
+        df["producer_id_destino"] = df["producer_id_destino"].apply(normalize_farm_id)
     
     # Filtrar por trimestre si aplica
     if quarter is not None and "date" in df.columns:
