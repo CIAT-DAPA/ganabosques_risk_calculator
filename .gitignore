@@ -18,3 +18,9 @@ dist/
 .ipynb_checkpoints/
 .DS_Store
 tests/__pycache__/
+.pytest_cache/
+.coverage
+
+# Logs
+logs/
+*.log

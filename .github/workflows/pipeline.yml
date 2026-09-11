@@ -1,0 +1,68 @@
+name: Devops risk calculator ETL
+
+on:
+  push:
+    branches: [ "stage" ]
+    tags:
+    - 'v*'
+
+
+permissions:
+  contents: read
+
+jobs:
+
+# ------- START ETL PROCCESS -------- #
+
+  TestETL:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v3
+        with:
+          python-version: "3.10"
+
+      - name: Install Git and dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y git
+          python -m venv env
+          source env/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt  # Ensure the URL is correct here!
+          pip install pytest pytest-cov
+
+      - name: Run Tests
+        run: |
+          echo "Running tests..."
+          source env/bin/activate
+          pytest tests/ 
+
+# ------- END ETL PROCCESS -------- #    
+
+# ------- START MERGE PROCCESS -------- #
+
+  MergeMainETL:
+    needs: [TestETL]
+    name: Merge Stage with Main
+    permissions: write-all
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@master
+
+      - name: Merge stage -> main
+        uses: devmasx/merge-branch@master
+        with:
+          type: now
+          head_to_merge: ${{ github.ref }}
+          target_branch: main
+          github_token: ${{ github.token }}
+
+# ------- END MERGE PROCCESS -------- #
+
+# ------- START RELEASE PROCCESS -------- #
+
+
+
+# ------- END RELEASE PROCCESS -------- #
