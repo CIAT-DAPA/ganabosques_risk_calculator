@@ -1,3 +1,4 @@
+import importlib
 import sys
 import types
 from pathlib import Path
@@ -7,9 +8,15 @@ import pandas as pd
 import pytest
 from shapely.geometry import box
 
-# Se importa explícitamente porque process_metrics_chunk lo carga de forma perezosa
-# dentro del worker; los tests necesitan la referencia para poder sustituirlo.
-import ganabosques_risk_package.spatial_metrics as pkg_spatial_metrics_module
+# process_metrics_chunk importa esta función de forma perezosa dentro del worker,
+# así que hay que sustituirla en el módulo de origen. Se resuelve con
+# import_module y no con 'import ganabosques_risk_package.spatial_metrics as X'
+# porque el __init__ del paquete re-exporta la función con el mismo nombre que el
+# submódulo: con la forma 'import ... as' el nombre acabaría apuntando a la
+# función y no al módulo, según la versión del paquete que haya instalada.
+pkg_spatial_metrics_module = importlib.import_module(
+    'ganabosques_risk_package.spatial_metrics'
+)
 import parallel_processor
 
 
